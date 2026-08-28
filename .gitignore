@@ -1,0 +1,6 @@
+venv/
+_pycache_/
+*.pyc
+.DS_Store
+hls/**/conv_c1_proj/
+weights/

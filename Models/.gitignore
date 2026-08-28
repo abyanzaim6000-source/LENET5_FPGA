@@ -1,0 +1,16 @@
+# Python environment - never commit this, it's huge and machine-specific
+venv/
+__pycache__/
+*.pyc
+
+# macOS system files
+.DS_Store
+
+# Vitis HLS project files (regenerated automatically, don't need to be
+# committed - they're large and machine-specific, just the .cpp/.h matter)
+hls/**/conv_c1_proj/
+
+# Keep models and weights out of git for now if they're large --
+# uncomment the next two lines if models/weights get slow to push/pull
+# models/
+# weights/

@@ -1,0 +1,6 @@
+format,source,tanh_accuracy,relu_accuracy,difference,tanh_rmse,relu_rmse,memory_kb
+Float32,baseline,98.40,98.00,-0.40,0.00000,0.00000,241.04
+"Fixed16 <13,3>",paper,97.20,97.20,+0.00,0.03605,0.03622,120.52
+"Ultra-low (1,2)",our test,95.40,69.60,-25.80,0.07105,0.07038,30.13
+INT8,our ext,98.40,98.20,-0.20,0.00111,0.00115,60.26
+INT4,our ext,97.80,98.00,+0.20,0.02013,0.02096,30.13
