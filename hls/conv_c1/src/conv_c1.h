@@ -17,4 +17,10 @@ void conv_c1(
     float output[IN_H][IN_W][OUT_C]
 );
 
+void conv_c1_linebuf(
+    float input[IN_H][IN_W][IN_C],
+    float weights[K][K][IN_C][OUT_C],
+    float bias[OUT_C],
+    float output[IN_H][IN_W][OUT_C]
+);
 #endif
