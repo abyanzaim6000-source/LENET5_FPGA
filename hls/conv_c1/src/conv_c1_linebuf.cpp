@@ -14,8 +14,7 @@ void conv_c1_linebuf(
     // Line buffer: holds the last K rows of the (padded) input.
     // Fully partitioned so all K*K window values are available every cycle.
     static float line_buf[K][IN_W + 2*PAD][IN_C];
-    #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
-    #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=3
+    #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=0
 
     // Window register: the current K x K patch the kernel is looking at.
     float window[K][K][IN_C];
