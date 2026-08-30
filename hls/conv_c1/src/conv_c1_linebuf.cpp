@@ -19,6 +19,7 @@ void conv_c1_linebuf(
     // Window register: the current K x K patch the kernel is looking at.
     float window[K][K][IN_C];
     #pragma HLS ARRAY_PARTITION variable=window complete dim=0
+    #pragma HLS ARRAY_PARTITION variable=output complete dim=3
 
     // Initialize line buffer to zero (handles top padding rows)
     for (int r = 0; r < K; r++)
