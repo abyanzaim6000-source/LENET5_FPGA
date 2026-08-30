@@ -9,6 +9,7 @@ void conv_c1(
     float bias[OUT_C],
     float output[IN_H][IN_W][OUT_C]
 ) {
+    #pragma HLS ARRAY_PARTITION variable=weights complete dim=0
     for (int o = 0; o < OUT_C; o++) {
         for (int r = 0; r < IN_H; r++) {
             for (int c = 0; c < IN_W; c++) {
