@@ -4,7 +4,7 @@
 // The paper uses 8. Made parameterizable so we can compare PE_COUNT =
 // 1, 2, 4, 8 and observe the latency/resource tradeoff directly.
 #define PE_COUNT 8
-#define TOTAL_MACS (K * K * IN_C)           // 5*5*1 = 25 MAC operations per output CHANNEL
+#define TOTAL_MACS (K * K * IN_C)           // 5*5*1 = 25 MACs per output channel
 #define MACS_PER_PE ((TOTAL_MACS + PE_COUNT - 1) / PE_COUNT)  // work each PE handles
 
 void conv_c1_systolic(
@@ -49,8 +49,10 @@ void conv_c1_systolic(
             }
         }
 
+        // NOTE: no PIPELINE II=1 here anymore -- this loop is now allowed
+        // to take multiple cycles per output pixel, which is exactly what
+        // lets PE_COUNT genuinely control resource usage.
         for (int out_c = 0; out_c < IN_W; out_c++) {
-            #pragma HLS PIPELINE II=1
 
             for (int kr = 0; kr < K; kr++)
                 for (int kc = 0; kc < K; kc++)
@@ -60,19 +62,18 @@ void conv_c1_systolic(
             for (int o = 0; o < OUT_C; o++) {
 
                 // Reset the systolic chain's partial sums for this output channel
-                for (int out_c = 0; out_c < IN_W; out_c++) {
-    // NOTE: no PIPELINE II=1 here anymore -- this loop is now allowed
-    // to take multiple cycles per output pixel, which is exactly what
-    // lets PE_COUNT genuinely control resource usage.
+                for (int p = 0; p < PE_COUNT; p++) {
+                    #pragma HLS UNROLL
                     partial_sum[p] = 0;
                 }
 
                 // Flatten the (kr, kc, i) MAC space into a single index,
-                // and distribute MACs_PER_PE of them to each PE
+                // and distribute MACs_PER_PE of them to each PE.
+                // THIS loop is where the pipelining now lives.
                 for (int m = 0; m < MACS_PER_PE; m++) {
                     #pragma HLS PIPELINE II=1
-                        for (int p = 0; p < PE_COUNT; p++) {
-                            #pragma HLS UNROLL
+                    for (int p = 0; p < PE_COUNT; p++) {
+                        #pragma HLS UNROLL
                         int mac_idx = m * PE_COUNT + p;
                         if (mac_idx < TOTAL_MACS) {
                             int kr = mac_idx / (K * IN_C);
