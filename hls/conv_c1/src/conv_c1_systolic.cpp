@@ -4,7 +4,7 @@
 // The paper uses 8. Made parameterizable so we can compare PE_COUNT =
 // 1, 2, 4, 8 and observe the latency/resource tradeoff directly.
 #define PE_COUNT 8
-#define TOTAL_MACS (K * K * OUT_C)          // 5*5*6 = 150 total MAC operations per output pixel
+#define TOTAL_MACS (K * K * IN_C)           // 5*5*1 = 25 MAC operations per output CHANNEL
 #define MACS_PER_PE ((TOTAL_MACS + PE_COUNT - 1) / PE_COUNT)  // work each PE handles
 
 void conv_c1_systolic(
