@@ -60,16 +60,19 @@ void conv_c1_systolic(
             for (int o = 0; o < OUT_C; o++) {
 
                 // Reset the systolic chain's partial sums for this output channel
-                for (int p = 0; p < PE_COUNT; p++) {
-                    #pragma HLS UNROLL
+                for (int out_c = 0; out_c < IN_W; out_c++) {
+    // NOTE: no PIPELINE II=1 here anymore -- this loop is now allowed
+    // to take multiple cycles per output pixel, which is exactly what
+    // lets PE_COUNT genuinely control resource usage.
                     partial_sum[p] = 0;
                 }
 
                 // Flatten the (kr, kc, i) MAC space into a single index,
                 // and distribute MACs_PER_PE of them to each PE
                 for (int m = 0; m < MACS_PER_PE; m++) {
-                    for (int p = 0; p < PE_COUNT; p++) {
-                        #pragma HLS UNROLL
+                    #pragma HLS PIPELINE II=1
+                        for (int p = 0; p < PE_COUNT; p++) {
+                            #pragma HLS UNROLL
                         int mac_idx = m * PE_COUNT + p;
                         if (mac_idx < TOTAL_MACS) {
                             int kr = mac_idx / (K * IN_C);
