@@ -1,11 +1,9 @@
 #include "conv_c1.h"
 
 // Number of parallel Processing Elements (PEs) in the systolic MAC chain.
-// The paper uses 8. Made parameterizable so we can compare PE_COUNT =
-// 1, 2, 4, 8 and observe the latency/resource tradeoff directly.
 #define PE_COUNT 8
 #define TOTAL_MACS (K * K * IN_C)           // 5*5*1 = 25 MACs per output channel
-#define MACS_PER_PE ((TOTAL_MACS + PE_COUNT - 1) / PE_COUNT)  // work each PE handles
+#define MACS_PER_PE ((TOTAL_MACS + PE_COUNT - 1) / PE_COUNT)
 
 void conv_c1_systolic(
     float input[IN_H][IN_W][IN_C],
@@ -13,6 +11,19 @@ void conv_c1_systolic(
     float bias[OUT_C],
     float output[IN_H][IN_W][OUT_C]
 ) {
+    // AXI4 Master interfaces: each array gets its own bus to DDR memory
+    #pragma HLS INTERFACE m_axi port=input offset=slave bundle=gmem0
+    #pragma HLS INTERFACE m_axi port=weights offset=slave bundle=gmem1
+    #pragma HLS INTERFACE m_axi port=bias offset=slave bundle=gmem2
+    #pragma HLS INTERFACE m_axi port=output offset=slave bundle=gmem3
+
+    // AXI4-Lite control interface: lets the ARM processor start/stop/check status
+    #pragma HLS INTERFACE s_axilite port=input bundle=control
+    #pragma HLS INTERFACE s_axilite port=weights bundle=control
+    #pragma HLS INTERFACE s_axilite port=bias bundle=control
+    #pragma HLS INTERFACE s_axilite port=output bundle=control
+    #pragma HLS INTERFACE s_axilite port=return bundle=control
+
     #pragma HLS ARRAY_PARTITION variable=weights complete dim=0
 
     static float line_buf[K][IN_W + 2*PAD][IN_C];
@@ -22,7 +33,6 @@ void conv_c1_systolic(
     float window[K][K][IN_C];
     #pragma HLS ARRAY_PARTITION variable=window complete dim=0
 
-    // Partial sum registers -- one per PE, forming the systolic chain
     float partial_sum[PE_COUNT];
     #pragma HLS ARRAY_PARTITION variable=partial_sum complete dim=0
 
@@ -49,9 +59,6 @@ void conv_c1_systolic(
             }
         }
 
-        // NOTE: no PIPELINE II=1 here anymore -- this loop is now allowed
-        // to take multiple cycles per output pixel, which is exactly what
-        // lets PE_COUNT genuinely control resource usage.
         for (int out_c = 0; out_c < IN_W; out_c++) {
 
             for (int kr = 0; kr < K; kr++)
@@ -61,15 +68,11 @@ void conv_c1_systolic(
 
             for (int o = 0; o < OUT_C; o++) {
 
-                // Reset the systolic chain's partial sums for this output channel
                 for (int p = 0; p < PE_COUNT; p++) {
                     #pragma HLS UNROLL
                     partial_sum[p] = 0;
                 }
 
-                // Flatten the (kr, kc, i) MAC space into a single index,
-                // and distribute MACs_PER_PE of them to each PE.
-                // THIS loop is where the pipelining now lives.
                 for (int m = 0; m < MACS_PER_PE; m++) {
                     #pragma HLS PIPELINE II=1
                     for (int p = 0; p < PE_COUNT; p++) {
@@ -84,7 +87,6 @@ void conv_c1_systolic(
                     }
                 }
 
-                // Final reduction: sum all PE partial results + bias
                 float acc = bias[o];
                 for (int p = 0; p < PE_COUNT; p++) {
                     #pragma HLS UNROLL
