@@ -4,3 +4,19 @@ _pycache_/
 .DS_Store
 hls/**/conv_c1_proj/
 weights/
+
+# Vivado generated files
+*.cache/
+*.gen/
+*.hw/
+*.ip_user_files/
+*.sim/
+*.runs/
+*.jou
+*.log
+.Xil/
+
+# Nested duplicate clone / HLS temp
+LENET5_FPGA/
+Lenet5_fpga_top/*.xpr.lock
+hls/**/conv_c1_proj/**/impl/
