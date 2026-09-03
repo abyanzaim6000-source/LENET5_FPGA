@@ -32,3 +32,27 @@ paper's exact architecture.
 warning rather than assuming; (2) PIPELINE II=1 forces complete unrolling of everything inside it, 
 which can silently defeat resource-sharing goals; (3) AXI interfaces and array partitioning are 
 fundamentally incompatible on the same array — burst-copy to local buffers is the fix.
+
+## 2026-09-03 — Bootstrap C3 convolution baseline IP
+
+Started the next item on the "not yet done" list from the entry above: applying the C1 process to 
+C3. Added `hls/conv_c3/` following the exact same pattern as C1's original baseline and S2's 
+pooling IP — a plain, unoptimized `conv_c3.cpp`/`.h` (no pragmas) plus a hand-computable testbench.
+
+C3 differs from C1 in two structural ways that matter for the coming optimization pass: input is 
+14×14×6 (S2's pooled output, not the raw 28×28×1 image) and padding is "valid" instead of "same" 
+(matches `lenet5_relu.py` — C3 has no `padding=` argument, so it defaults to valid). The wider 
+input channel fan-in (6 vs 1) means the inner MAC loop is already 6x deeper than C1's before any 
+unrolling, and valid padding means every output pixel — including corners — sees a full K×K×IN_C 
+window, which simplified the testbench (no edge-vs-center distinction needed, just check any pixel 
+against 5×5×6=150 with all-ones inputs/weights).
+
+Verified functionally with a local `g++` compile + run of the testbench (TEST PASSED) — this is 
+not yet a Vitis HLS C-simulation/synthesis run, so no real latency/II/DSP/FF/LUT/Fmax numbers exist 
+yet for C3. That's the immediate next step.
+
+**Not yet done**: run C-simulation and baseline synthesis for C3 in Vitis HLS to get real numbers 
+(mirrors the very first C1 baseline step), then repeat the rest of the arc that worked for C1 — 
+diagnose the real memory bottleneck, line-buffer streaming, systolic PE-count variant, AXI 
+conversion. Still also outstanding from before: PE_COUNT=1/2/4 sweep on C1, bitstream generation, 
+reusable/parameterized core, DMA block.

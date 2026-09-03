@@ -105,3 +105,28 @@ Target device: xc7z020iclg484-1L (Zynq-7020, ZedBoard) | Clock: 10ns (100MHz) th
 - Repeat the full C1 methodology (baseline → line buffer → systolic → AXI) for C3, since only C1 has been done end-to-end.
 - Reusable/parameterized IP generalization (same core handling both C1 and C3 via runtime parameters) — currently two separate hard-coded dimension sets (`IN_H`, `IN_W`, etc. in `conv_c1.h`), not yet parameterized.
 - Add AXI DMA block if closer fidelity to the paper's exact architecture is desired.
+
+
+
+## S2 Pooling — HLS Optimization Log
+
+| Experiment | Latency (cycles) | II | Fmax equiv. (clock period) | DSP | FF | LUT | Notes |
+|---|---|---|---|---|---|---|---|
+| Baseline (no pragmas) | 2,379 | 2 (auto-pipelined) | 7.256ns (~138MHz) | 7 | 1,192 | 1,809 | No MACs -- just add+divide. Auto-pipelined by HLS without explicit PIPELINE pragma |
+
+
+
+## C3 Convolution — HLS Optimization Log
+
+Target device: xc7z020iclg484-1L (Zynq-7020, ZedBoard) | Clock: 10ns (100MHz), same as C1/S2.
+
+| Experiment | Latency (cycles) | II | Fmax (MHz) | DSP-related units | FF | LUT | Notes |
+|---|---|---|---|---|---|---|---|
+| Baseline (no pragmas) | *pending Vitis HLS run* | *pending* | *pending* | *pending* | *pending* | *pending* | Functionally verified via local g++ testbench (TEST PASSED), not yet run through Vitis HLS C-simulation/synthesis |
+
+**Architecture differences from C1's baseline** (relevant to how the optimization arc will differ):
+- Input is 14×14×6 (S2's pooled output), not 28×28×1 — 6x deeper MAC inner loop before any unrolling.
+- Padding is "valid", not "same" — no boundary zero-checks, so the line-buffer variant won't need the padding-validity logic that C1's did.
+- Output is 10×10×16 (vs C1's 28×28×6) — smaller spatial extent, more output channels; expect the bottleneck-diagnosis step to reveal a different limiting array than C1's `input`.
+
+**Next step**: run C-simulation and baseline synthesis in Vitis HLS to fill in the row above, then repeat C1's methodology (identify true bottleneck → line buffer → systolic PE variant → AXI conversion).
