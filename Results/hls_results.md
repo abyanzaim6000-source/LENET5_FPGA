@@ -112,7 +112,8 @@ Target device: xc7z020iclg484-1L (Zynq-7020, ZedBoard) | Clock: 10ns (100MHz) th
 
 | Experiment | Latency (cycles) | II | Fmax equiv. (clock period) | DSP | FF | LUT | Notes |
 |---|---|---|---|---|---|---|---|
-| Baseline (no pragmas) | 2,379 | 2 (auto-pipelined) | 7.256ns (~138MHz) | 7 | 1,192 | 1,809 | No MACs -- just add+divide. Auto-pipelined by HLS without explicit PIPELINE pragma |
+| Baseline, AveragePooling (no pragmas) — **superseded** | 2,379 | 2 (auto-pipelined) | 7.256ns (~138MHz) | 7 | 1,192 | 1,809 | No MACs -- just add+divide. Auto-pipelined by HLS without explicit PIPELINE pragma. Numbers no longer apply — source has since switched to MaxPooling (below) to match `lenet5_relu.py`'s S2 |
+| Baseline, MaxPooling (no pragmas) | *pending Vitis HLS run* | *pending* | *pending* | *pending* | *pending* | *pending* | Comparison-based (no divide unit, no DSP expected). Functionally verified via local g++ testbench (TEST PASSED), not yet re-run through Vitis HLS |
 
 
 

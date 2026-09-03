@@ -94,3 +94,27 @@ pre-activation sum 400, ReLU leaves it unchanged, expected output is 400.0. Re-v
 The whole dense stack (C5, and the still-unbuilt F6/Output) is ReLU now — one variant,
 `lenet5_relu.py`, end-to-end alongside the convs. That removes the reconciliation item from the
 "not yet done" list above.
+
+## 2026-09-03 — Switch S2 pooling to MaxPool; full ReLU-variant consistency pass
+
+Changed `pool_s2.cpp`/`_tb.cpp` from AveragePooling to MaxPooling, matching `lenet5_relu.py`'s S2
+layer (project standardized on ReLU+MaxPool throughout, not the tanh+AvgPool `lenet5.py` variant).
+Testbench check updated from the average (14.5) to the max (29) of the same {0,1,28,29} window —
+same hand-computable style, different expected value. Re-verified via `g++` build (TEST PASSED).
+
+Also fixed a stale comment in `pool_s2.h` still describing "2x2 average pooling", and audited every
+other `hls/**/src/*.cpp`/`.h` file for leftover tanh/average-pool references (`grep -rniE
+"tanh|average|avgpool"`) — nothing else turned up. C1 (all 3 variants), C3, and C5 were already ReLU
+from earlier fixes; S2 was the last holdout. Re-compiled and re-ran all six existing testbenches
+(conv_c1, conv_c1_linebuf, conv_c1_systolic, conv_c3, dense_c5, pool_s2) with `g++` — all TEST PASSED.
+
+One documentation correction that came out of this: `Results/hls_results.md`'s S2 baseline row had
+real Vitis HLS numbers (2,379 cycles, DSP=7, etc.), but those were synthesized against the *old*
+AveragePooling source — they no longer describe what's actually in the repo now that the algorithm
+changed to MaxPooling (comparison-based, no divide unit — different resource profile expected).
+Marked that row **superseded** and added a new pending row for the MaxPooling baseline.
+
+**Not yet done**: re-run Vitis HLS C-simulation/synthesis on the new MaxPooling S2 baseline to get
+real numbers (the AveragePooling-era numbers no longer apply). Still outstanding from before: PE_COUNT
+sweep on C1, bitstream generation, C3's full optimization arc, F6/Output dense layers, reusable/
+parameterized core, DMA block.

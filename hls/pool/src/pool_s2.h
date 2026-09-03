@@ -1,7 +1,7 @@
 #ifndef POOL_S2_H
 #define POOL_S2_H
 
-// Dimensions for S2: input is C1's output (28x28x6), 2x2 average pooling, stride 2
+// Dimensions for S2: input is C1's output (28x28x6), 2x2 max pooling, stride 2
 #define IN_H 28
 #define IN_W 28
 #define CHANNELS 6

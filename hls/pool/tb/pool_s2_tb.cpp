@@ -17,8 +17,8 @@ int main() {
 
     // Check the top-left output window by hand:
     // window = input[0][0], input[0][1], input[1][0], input[1][1]
-    //        = 0, 1, 28, 29  -> average = 58/4 = 14.5
-    float expected = 14.5f;
+    //        = 0, 1, 28, 29  -> max = 29
+    float expected = 29.0f;  // max of {0, 1, 28, 29}, not the average (14.5)
     float actual = output[0][0][0];
 
     std::cout << "Expected top-left value: " << expected << std::endl;
