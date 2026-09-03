@@ -1,0 +1,41 @@
+#include <iostream>
+#include <cmath>
+#include "../src/dense_c5.h"
+
+int main() {
+    static float input[N_IN];
+    static float weights[N_IN][N_OUT];
+    static float bias[N_OUT];
+    static float output[N_OUT];
+
+    // Simple test: all-ones input, all-ones weights, zero bias.
+    // Pre-activation sum for every output neuron = N_IN = 400 (bias 0 +
+    // 400 taps of 1*1). tanh saturates to 1.0 well before an input of
+    // 400, so every output should be exactly 1.0f in float32.
+    for (int i = 0; i < N_IN; i++)
+        input[i] = 1.0f;
+
+    for (int i = 0; i < N_IN; i++)
+        for (int j = 0; j < N_OUT; j++)
+            weights[i][j] = 1.0f;
+
+    for (int j = 0; j < N_OUT; j++)
+        bias[j] = 0.0f;
+
+    dense_c5(input, weights, bias, output);
+
+    // Check the first output neuron -- should be exactly 1.0 (tanh saturation)
+    float expected = 1.0f;
+    float actual = output[0];
+
+    std::cout << "Expected output[0]: " << expected << std::endl;
+    std::cout << "Actual output[0]:   " << actual << std::endl;
+
+    if (std::fabs(expected - actual) < 1e-5) {
+        std::cout << "TEST PASSED" << std::endl;
+        return 0;
+    } else {
+        std::cout << "TEST FAILED" << std::endl;
+        return 1;
+    }
+}

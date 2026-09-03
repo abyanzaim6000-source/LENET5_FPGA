@@ -130,3 +130,20 @@ Target device: xc7z020iclg484-1L (Zynq-7020, ZedBoard) | Clock: 10ns (100MHz), s
 - Output is 10×10×16 (vs C1's 28×28×6) — smaller spatial extent, more output channels; expect the bottleneck-diagnosis step to reveal a different limiting array than C1's `input`.
 
 **Next step**: run C-simulation and baseline synthesis in Vitis HLS to fill in the row above, then repeat C1's methodology (identify true bottleneck → line buffer → systolic PE variant → AXI conversion).
+
+
+
+## C5 Dense (Fully-Connected) — HLS Optimization Log
+
+Target device: xc7z020iclg484-1L (Zynq-7020, ZedBoard) | Clock: 10ns (100MHz), same as C1/S2/C3.
+
+| Experiment | Latency (cycles) | II | Fmax (MHz) | DSP-related units | FF | LUT | Notes |
+|---|---|---|---|---|---|---|---|
+| Baseline (no pragmas) | *pending Vitis HLS run* | *pending* | *pending* | *pending* | *pending* | *pending* | Functionally verified via local g++ testbench (TEST PASSED), not yet run through Vitis HLS C-simulation/synthesis |
+
+**Architecture differences from C1/C3's baseline** (relevant to how the optimization arc will differ):
+- No sliding window — this is a dense matrix-vector multiply (400×120 weight matrix), so there's no line-buffer step to build; the eventual bottleneck diagnosis will likely center on the weight array's memory ports rather than an input/window array.
+- Activation is **tanh**, not ReLU — matches `lenet5.py`, not `lenet5_relu.py` (which C1/C3/S2 followed). This is an intentional variant switch for the dense layers, not an oversight; needs to be reconciled before full-pipeline integration (see journal entry).
+- 400×120 = 48,000 weights, by far the largest weight array of any IP built so far (vs. C1's 150, C3's 2,400) — expect memory-port pressure to dominate the baseline bottleneck.
+
+**Next step**: run C-simulation and baseline synthesis in Vitis HLS to fill in the row above, then diagnose the true bottleneck (weights array vs. input) before choosing a partitioning/streaming strategy.

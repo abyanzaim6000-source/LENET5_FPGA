@@ -56,3 +56,27 @@ yet for C3. That's the immediate next step.
 diagnose the real memory bottleneck, line-buffer streaming, systolic PE-count variant, AXI 
 conversion. Still also outstanding from before: PE_COUNT=1/2/4 sweep on C1, bitstream generation, 
 reusable/parameterized core, DMA block.
+
+## 2026-09-03 — Bootstrap C5 dense (fully-connected) baseline IP
+
+Added `hls/dense_c5/`, the first fully-connected layer IP and the first departure from the conv/pool
+pattern — same plain-baseline + hand-computable-testbench structure as C1/C3/S2, but the loop nest
+is now a matrix-vector multiply (one MAC loop per output neuron) instead of a sliding-window
+convolution, and there's no spatial dimension at all: 400 flattened inputs (S4's pooled 5×5×16
+output) straight to 120 outputs.
+
+Activation is **tanh**, not ReLU — deliberately matching `lenet5.py` (the original tanh+AvgPool
+network) rather than `lenet5_relu.py`, which C1/C3/S2 have been following so far. This means the
+dense layers are being ported from a different variant than the convs; worth remembering when it's
+time to chain layers together into a full pipeline, since a tanh C5 can't feed cleanly from a ReLU
+C3/S4 without picking one variant end-to-end (or explicitly supporting both).
+
+Testbench uses the same all-ones input/weights, zero-bias trick as before, but the "hand-computable"
+check now relies on tanh saturation rather than passthrough: pre-activation sum is exactly
+N_IN = 400 for every neuron, and tanh saturates to 1.0f in float32 well before an input that large,
+so every output should be exactly 1.0. Verified via local `g++` build (TEST PASSED); no Vitis HLS
+numbers yet.
+
+**Not yet done**: Vitis HLS C-simulation/synthesis for C5's baseline numbers, then F6 (120→84,
+tanh) and Output (84→10, softmax) to complete the dense stack, plus resolving the ReLU-vs-tanh
+variant mismatch noted above before any full-network integration.
