@@ -118,3 +118,27 @@ Marked that row **superseded** and added a new pending row for the MaxPooling ba
 real numbers (the AveragePooling-era numbers no longer apply). Still outstanding from before: PE_COUNT
 sweep on C1, bitstream generation, C3's full optimization arc, F6/Output dense layers, reusable/
 parameterized core, DMA block.
+
+## 2026-09-03 — Add S4 pooling IP, ARRAY_PARTITION included from the start
+
+`Results/hls_results.md` picked up real Vitis HLS numbers for S2's max-pooling baseline since the
+last entry — `ARRAY_PARTITION` on the input array reached II=1, DSP=0 (no divide/MAC hardware needed
+for pure comparisons), FF=576, LUT=589, a genuine improvement over the old average-pooling numbers
+at every metric. Another session committed the actual fix straight to `pool_s2.cpp` (commit
+`720c664`, pushed while this one was in progress): cyclic-partition `input` on dims 1 and 2
+(row, col) with factor 2, so the 2×2 window's four loads land in four separate memory banks instead
+of contending for the same one — that's what resolved the II=2 violation.
+
+Built `hls/pool_s4/` on that exact pattern: same max-pooling logic as `pool_s2.cpp`, resized for
+C3's actual output (10×10×16 → 5×5×16, still 2×2/stride 2), with the identical
+`#pragma HLS ARRAY_PARTITION variable=input cyclic factor=2 dim=1/2` plus an explicit
+`#pragma HLS PIPELINE II=1` included from the start — no baseline-first, discover-the-bottleneck-
+later step needed this time, since S2 already proved the fix. (First draft of this file guessed a
+channel-dim `complete` partition instead, before `720c664` landed with the real answer — corrected
+before committing.) Testbench follows the same hand-computable style, just resized: sequential input
+0,1,2..., top-left window {0,1,10,11} (IN_W=10, not S2's 28), expected max = 11. Verified via `g++`
+build (TEST PASSED).
+
+**Not yet done**: run C-simulation and synthesis for S4 in Vitis HLS to confirm it actually reaches
+II=1/DSP=0 at these dimensions. Still outstanding from before: PE_COUNT sweep on C1, bitstream
+generation, C3's full optimization arc, F6/Output dense layers, reusable/parameterized core, DMA block.

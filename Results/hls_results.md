@@ -148,3 +148,32 @@ Target device: xc7z020iclg484-1L (Zynq-7020, ZedBoard) | Clock: 10ns (100MHz), s
 - 400×120 = 48,000 weights, by far the largest weight array of any IP built so far (vs. C1's 150, C3's 2,400) — expect memory-port pressure to dominate the baseline bottleneck.
 
 **Next step**: run C-simulation and baseline synthesis in Vitis HLS to fill in the row above, then diagnose the true bottleneck (weights array vs. input) before choosing a partitioning/streaming strategy.
+
+## S2 Pooling — HLS Optimization Log (final, corrected)
+
+| Stage | Latency (cycles) | II | DSP | FF | LUT | Notes |
+|---|---|---|---|---|---|---|
+| ~~1. Avg pooling, no pragma~~ | ~~2,379~~ | ~~2~~ | ~~7~~ | ~~1,192~~ | ~~1,809~~ | Superseded — wrong pooling variant for the project's ReLU+MaxPool standardization |
+| ~~2. Avg pooling + ARRAY_PARTITION~~ | ~~—~~ | ~~1~~ | ~~11~~ | ~~1,431~~ | ~~2,194~~ | Superseded — same reason; the fix was applied to the wrong underlying algorithm |
+| **3. Max pooling + ARRAY_PARTITION (final)** | **1,186** | **1** | **0** | **576** | **589** | Correct variant, all loop constraints satisfied. DSP=0 because pure comparisons need no MAC hardware — genuinely cheaper than the average-pooling version at every resource metric |
+
+`pool_s2.cpp`'s committed source now matches stage 3: `ARRAY_PARTITION cyclic factor=2` on dims 1
+and 2 (row, col) of `input` (commit `720c664`) — cyclic-partitioning by 2 in both spatial dims
+splits each 2×2 pooling window's four loads across four separate memory banks, resolving the port
+contention that capped II at 2.
+
+
+
+## S4 Pooling — HLS Optimization Log
+
+Target device: xc7z020iclg484-1L (Zynq-7020, ZedBoard) | Clock: 10ns (100MHz), same as C1/S2/C3/C5.
+
+| Experiment | Latency (cycles) | II | DSP | FF | LUT | Notes |
+|---|---|---|---|---|---|---|
+| Max pooling + ARRAY_PARTITION, from the start | *pending Vitis HLS run* | *pending (targeting 1)* | *pending (targeting 0)* | *pending* | *pending* | `ARRAY_PARTITION cyclic factor=2` on `input` dims 1+2 (row, col) + explicit `PIPELINE II=1` — identical fix to S2's (commit `720c664`), applied from the start instead of discovered fresh. Functionally verified via local g++ testbench (TEST PASSED), not yet run through Vitis HLS |
+
+**Architecture differences from S2's baseline**:
+- Input is 10×10×16 (C3's output, valid-padded), not 28×28×6 — smaller spatial extent, more channels (16 vs 6).
+- Same 2×2/stride-2 max pooling, same loop structure, same partitioning fix — only dimensions changed.
+
+**Next step**: run C-simulation and synthesis in Vitis HLS to confirm II=1/DSP=0 actually hold at these dimensions.
