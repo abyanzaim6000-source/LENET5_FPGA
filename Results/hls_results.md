@@ -121,16 +121,19 @@ Target device: xc7z020iclg484-1L (Zynq-7020, ZedBoard) | Clock: 10ns (100MHz) th
 
 Target device: xc7z020iclg484-1L (Zynq-7020, ZedBoard) | Clock: 10ns (100MHz), same as C1/S2.
 
-| Experiment | Latency (cycles) | II | Fmax (MHz) | DSP-related units | FF | LUT | Notes |
-|---|---|---|---|---|---|---|---|
-| Baseline (no pragmas) | *pending Vitis HLS run* | *pending* | *pending* | *pending* | *pending* | *pending* | Functionally verified via local g++ testbench (TEST PASSED), not yet run through Vitis HLS C-simulation/synthesis |
+| Experiment | Latency (cycles) | Interval (cycles) | Inner-loop II (achieved/target) | DSP | FF | LUT | BRAM_18K | Fmax (MHz) | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| **Baseline (no pragmas)** | **1,225,601** | **1,225,602** | **5 / 1** | **5** | **722** | **1,622** | **0** | **137.82** | csim: TEST PASSED (corner value 150). Top-level function not pipelined (Pipeline Type: no) — Interval ≈ Latency. Inner 150-iteration MAC loop (`VITIS_LOOP_17_4_18_5_19_6`) is pipelined but capped at II=5, not II=1 |
+
+**Bottleneck diagnosis — accumulator-limited, NOT memory-port-limited (differs from C1's baseline pattern):**
+All 4 II-violation warnings (attempted II=1 through II=4) trace to the same cause — a carried dependence on the scalar accumulator `acc` (`acc_1_write_ln19` store vs. `acc_1_load` load, `conv_c3.cpp:19-20`), not port contention on `input`/`weights` like C1's baseline. The 32-bit float adder (`fadd_32ns_..._5`) has a 5-cycle latency, and each MAC iteration must read back the *previous* iteration's `acc` before adding — so II bottoms out exactly at 5, matching the adder's latency. `input_r`/`weights`/`bias`/`output_r` were all mapped to plain single-port `ap_memory` with no partitioning conflict noted in the log.
 
 **Architecture differences from C1's baseline** (relevant to how the optimization arc will differ):
 - Input is 14×14×6 (S2's pooled output), not 28×28×1 — 6x deeper MAC inner loop before any unrolling.
 - Padding is "valid", not "same" — no boundary zero-checks, so the line-buffer variant won't need the padding-validity logic that C1's did.
-- Output is 10×10×16 (vs C1's 28×28×6) — smaller spatial extent, more output channels; expect the bottleneck-diagnosis step to reveal a different limiting array than C1's `input`.
+- Output is 10×10×16 (vs C1's 28×28×6) — smaller spatial extent, more output channels. Confirmed: the true bottleneck is **not** the `input`/`weights` arrays at all (unlike C1's baseline) — it's the serial floating-point accumulation chain.
 
-**Next step**: run C-simulation and baseline synthesis in Vitis HLS to fill in the row above, then repeat C1's methodology (identify true bottleneck → line buffer → systolic PE variant → AXI conversion).
+**Next step**: optimize the accumulation — likely an adder-tree / partial-sum unrolling to break the single-`acc` serial dependency, probably combined with `ARRAY_PARTITION` on `input`/`weights` once the accumulator bottleneck is resolved (partitioning alone won't help while `acc` is still the limiter). Then continue C1's methodology (line buffer → systolic PE variant → AXI conversion).
 
 
 
