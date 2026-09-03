@@ -18,4 +18,18 @@ void conv_c3(
     float output[OUT_H][OUT_W][OUT_C]
 );
 
+void conv_c3_partialsum(
+    float input[IN_H][IN_W][IN_C],
+    float weights[K][K][IN_C][OUT_C],
+    float bias[OUT_C],
+    float output[OUT_H][OUT_W][OUT_C]
+);
+
+void conv_c3_partialsum_roundrobin(
+    float input[IN_H][IN_W][IN_C],
+    float weights[K][K][IN_C][OUT_C],
+    float bias[OUT_C],
+    float output[OUT_H][OUT_W][OUT_C]
+);
+
 #endif
