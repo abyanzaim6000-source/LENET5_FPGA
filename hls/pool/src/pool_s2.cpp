@@ -6,6 +6,8 @@ void pool_s2(
     float input[IN_H][IN_W][CHANNELS],
     float output[OUT_H][OUT_W][CHANNELS]
 ) {
+#pragma HLS ARRAY_PARTITION variable=input cyclic factor=2 dim=1
+#pragma HLS ARRAY_PARTITION variable=input cyclic factor=2 dim=2
     for (int out_r = 0; out_r < OUT_H; out_r++) {
         for (int out_c = 0; out_c < OUT_W; out_c++) {
             for (int ch = 0; ch < CHANNELS; ch++) {
