@@ -1,5 +1,4 @@
 #include "dense_c5.h"
-#include <cmath>
 
 // This loop structure is DELIBERATELY identical to manual_layers.py's
 // dense() -- one MAC loop per output neuron, bias first, then activation
@@ -15,7 +14,7 @@ void dense_c5(
         for (int i = 0; i < N_IN; i++) {
             acc += input[i] * weights[i][j];
         }
-        // tanh activation, applied inline (matches lenet5.py)
-        output[j] = tanhf(acc);
+        // ReLU activation, applied inline (matches lenet5_relu.py)
+        output[j] = (acc > 0) ? acc : 0;
     }
 }

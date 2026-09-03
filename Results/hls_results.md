@@ -143,7 +143,7 @@ Target device: xc7z020iclg484-1L (Zynq-7020, ZedBoard) | Clock: 10ns (100MHz), s
 
 **Architecture differences from C1/C3's baseline** (relevant to how the optimization arc will differ):
 - No sliding window — this is a dense matrix-vector multiply (400×120 weight matrix), so there's no line-buffer step to build; the eventual bottleneck diagnosis will likely center on the weight array's memory ports rather than an input/window array.
-- Activation is **tanh**, not ReLU — matches `lenet5.py`, not `lenet5_relu.py` (which C1/C3/S2 followed). This is an intentional variant switch for the dense layers, not an oversight; needs to be reconciled before full-pipeline integration (see journal entry).
+- Activation is **ReLU** (updated 2026-09-03 from an initial tanh pass — see journal), matching `lenet5_relu.py`, same variant as C1/C3/S2. The dense stack now stays consistent with the convs end-to-end.
 - 400×120 = 48,000 weights, by far the largest weight array of any IP built so far (vs. C1's 150, C3's 2,400) — expect memory-port pressure to dominate the baseline bottleneck.
 
 **Next step**: run C-simulation and baseline synthesis in Vitis HLS to fill in the row above, then diagnose the true bottleneck (weights array vs. input) before choosing a partitioning/streaming strategy.

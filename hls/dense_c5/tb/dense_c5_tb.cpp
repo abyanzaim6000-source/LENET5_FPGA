@@ -10,8 +10,8 @@ int main() {
 
     // Simple test: all-ones input, all-ones weights, zero bias.
     // Pre-activation sum for every output neuron = N_IN = 400 (bias 0 +
-    // 400 taps of 1*1). tanh saturates to 1.0 well before an input of
-    // 400, so every output should be exactly 1.0f in float32.
+    // 400 taps of 1*1). ReLU passes positive values through unchanged,
+    // so every output should be exactly 400.0f.
     for (int i = 0; i < N_IN; i++)
         input[i] = 1.0f;
 
@@ -24,8 +24,8 @@ int main() {
 
     dense_c5(input, weights, bias, output);
 
-    // Check the first output neuron -- should be exactly 1.0 (tanh saturation)
-    float expected = 1.0f;
+    // Check the first output neuron -- should be exactly 400.0 (ReLU passthrough)
+    float expected = 400.0f;
     float actual = output[0];
 
     std::cout << "Expected output[0]: " << expected << std::endl;

@@ -80,3 +80,17 @@ numbers yet.
 **Not yet done**: Vitis HLS C-simulation/synthesis for C5's baseline numbers, then F6 (120→84,
 tanh) and Output (84→10, softmax) to complete the dense stack, plus resolving the ReLU-vs-tanh
 variant mismatch noted above before any full-network integration.
+
+## 2026-09-03 — Switch C5 to ReLU
+
+Corrected the tanh/ReLU mismatch flagged in the previous entry: C5 now uses ReLU, matching
+`lenet5_relu.py` and staying consistent with C1/C3/S2. Changed `dense_c5.cpp`'s activation line
+from `tanhf(acc)` to the same `(acc > 0) ? acc : 0` passthrough C1/C3 use, dropped the now-unused
+`<cmath>` include, and updated the testbench: the tanh-saturation check (expected 1.0) no longer
+applies, so it's back to the same passthrough style as C1/C3 — all-ones input/weights, zero bias,
+pre-activation sum 400, ReLU leaves it unchanged, expected output is 400.0. Re-verified via local
+`g++` build (TEST PASSED).
+
+The whole dense stack (C5, and the still-unbuilt F6/Output) is ReLU now — one variant,
+`lenet5_relu.py`, end-to-end alongside the convs. That removes the reconciliation item from the
+"not yet done" list above.
