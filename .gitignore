@@ -3,6 +3,9 @@ _pycache_/
 *.pyc
 .DS_Store
 hls/**/conv_c1_proj/
+hls/**/dense_c5_proj/
+hls/**/dense_c5_partialsum_proj/
+hls/**/dense_c5_partialsum5_proj/
 weights/
 
 # Vivado generated files
