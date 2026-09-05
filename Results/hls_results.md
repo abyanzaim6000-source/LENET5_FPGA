@@ -186,3 +186,41 @@ Target device: xc7z020iclg484-1L (Zynq-7020, ZedBoard) | Clock: 10ns (100MHz), s
 - Same 2×2/stride-2 max pooling, same loop structure, same partitioning fix — only dimensions changed.
 
 **Next step**: run C-simulation and synthesis in Vitis HLS to confirm II=1/DSP=0 actually hold at these dimensions.
+
+## S4 Pooling — HLS Optimization Log
+
+| Stage | Latency (cycles) | II | DSP | FF | LUT | Fmax | Notes |
+|---|---|---|---|---|---|---|---|
+| Max pooling + ARRAY_PARTITION (built correctly from start) | 409 (411 total) | **1** | **0** | 565 | 545 | 140.71 MHz | Reused S2's proven cyclic partition fix directly — no baseline-then-fix cycle needed. All loop constraints satisfied on first synthesis |
+
+#the same max-pooling kernel and array-partition strategy transferred directly from S2 to S4 with zero rework, demonstrating the reusable-IP principle in practice.
+
+## F6 Dense (Fully-Connected) — HLS Optimization Log
+
+Target device: xc7z020iclg484-1L (Zynq-7020, ZedBoard) | Clock: 10ns (100MHz), same as C1/S2/C3/C5/S4.
+
+| Experiment | Latency (cycles) | Interval (cycles) | Inner-loop II (achieved/target) | DSP | FF | LUT | Fmax (MHz) | Notes |
+|---|---|---|---|---|---|---|---|---|
+| **Partial-sum split (PE_COUNT=4), built directly** | *pending Vitis HLS run* | *pending* | *pending (targeting 4/1)* | *pending* | *pending* | *pending* | *pending* | csim: TEST PASSED (output[0]=120). Went straight to `dense_c5_partialsum.cpp`'s proven PE_COUNT=4 pattern — no serial-accumulator baseline built first, same as S2→S4's reuse. Not yet run through Vitis HLS C-simulation/synthesis |
+
+**Architecture**: 120 inputs → 84 outputs, ReLU. Identical MAC-stage structure to `dense_c5_partialsum.cpp`: the 120-tap reduction per output neuron is split across `PE_COUNT=4` independent `partial_sum[]` accumulators (`ARRAY_PARTITION complete` on `partial_sum` only — C5's bind-report diagnosis showed the bottleneck is the float adder's loop-carried recurrence, not a memory-port conflict, so `input`/`weights` are left unpartitioned), with `PIPELINE II=1` requested on the inner reduction loop. Only the dimensions changed from C5 (400→120 inputs, 120→84 outputs) — same reusable-IP principle as S2→S4.
+
+**Next step**: run C-simulation and synthesis in Vitis HLS to confirm the actual II (expected to land at 4, accumulation-limited, matching C5's floor — same fadd-latency mechanism, independent of N_IN) and record real DSP/FF/LUT/Fmax.
+
+## Output Dense (Fully-Connected, Softmax) — HLS Optimization Log
+
+Target device: xc7z020iclg484-1L (Zynq-7020, ZedBoard) | Clock: 10ns (100MHz), same as C1/S2/C3/C5/S4/F6.
+
+| Experiment | Latency (cycles) | Interval (cycles) | Inner-loop II (achieved/target) | DSP | FF | LUT | Fmax (MHz) | Notes |
+|---|---|---|---|---|---|---|---|---|
+| **Partial-sum split (PE_COUNT=4) MAC stage + separate softmax stage, built directly** | *pending Vitis HLS run* | *pending* | *pending (targeting 4/1 for the MAC stage)* | *pending* | *pending* | *pending* | *pending* | csim: TEST PASSED (all 10 outputs = 0.1, sum = 1.0). MAC stage went straight to `dense_c5_partialsum.cpp`'s proven PE_COUNT=4 pattern — no serial-accumulator baseline built first. Not yet run through Vitis HLS C-simulation/synthesis |
+
+**Architecture differences from F6/C5**: 84 inputs → 10 outputs, **softmax** instead of ReLU. Softmax needs the sum of every output neuron's exponential before any single one can be normalized, so it does not fit the single-pass "compute acc → activate → write output[j]" loop the ReLU layers use. `dense_output.cpp` is split into two explicit stages instead:
+1. **MAC stage** — identical PE_COUNT=4 partial-sum structure to `dense_c5_partialsum.cpp`/`dense_f6.cpp` (only `partial_sum[]` partitioned, not `input`/`weights`, per C5's diagnosis), writing each neuron's raw (pre-activation) accumulation into a small local `logits[10]` array.
+2. **Softmax stage** — a separate pass over the completed `logits` array once all 10 are available: max-subtraction for numerical stability, `exp`, sum, then divide.
+
+Only stage 1 carries the PE_COUNT=4 partial-sum pragmas; stage 2 is a short, inherently serial reduction/normalization over just 10 elements and is not expected to be a resource or II bottleneck.
+
+**Next step**: run C-simulation and synthesis in Vitis HLS to confirm the MAC stage's II (expected ~4, same mechanism as C5/F6) and record real DSP/FF/LUT/Fmax for the combined two-stage design.
+
+**Next step**: run C-simulation and synthesis in Vitis HLS to confirm the MAC stage's II (expected ~4, same as F6/C5) and record real DSP/FF/LUT/Fmax for the combined two-stage design.
