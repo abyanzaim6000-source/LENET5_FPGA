@@ -144,16 +144,19 @@ All 4 II-violation warnings (attempted II=1 through II=4) trace to the same caus
 
 Target device: xc7z020iclg484-1L (Zynq-7020, ZedBoard) | Clock: 10ns (100MHz), same as C1/S2/C3.
 
-| Experiment | Latency (cycles) | II | Fmax (MHz) | DSP-related units | FF | LUT | Notes |
-|---|---|---|---|---|---|---|---|
-| Baseline (no pragmas) | *pending Vitis HLS run* | *pending* | *pending* | *pending* | *pending* | *pending* | Functionally verified via local g++ testbench (TEST PASSED), not yet run through Vitis HLS C-simulation/synthesis |
+| Experiment | Latency (cycles) | Interval (cycles) | Inner-loop II (achieved/target) | DSP | FF | LUT | Fmax (MHz) | Notes |
+|---|---|---|---|---|---|---|---|---|
+| **Baseline (no pragmas)** | **241,681** | **241,682** | **5 / —** | **5** | **790** | **1,083** | **137.82** | csim: TEST PASSED (output[0]=400). `VITIS_LOOP_14_2` (inner 400-term MAC) is auto-pipelined at II=5; outer `VITIS_LOOP_12_1` (120 output neurons) is not pipelined |
+| **KEPT — Partial-sum split (PE_COUNT=4)**, `dense_c5_partialsum.cpp` | **48,031** | **48,032** | **4 / 1** | **7** | **1,863** | **2,253** | **111.66** | csim: TEST PASSED. Same `partial_sum[PE_COUNT]` pattern as `conv_c3_partialsum.cpp`: 400-term reduction split across 4 independent accumulator chains (100 terms each), combined at the end. Latency dropped ~5.0x vs. baseline. II only improved 5→4 (still not 1) — same accumulator-latency floor as C3's PE_COUNT=6 case. **This is the version kept** — lowest DSP among the II=4 options, clears the 100MHz target with room to spare |
+| EXPLORED, comparison point — PE_COUNT=5 | 38,437 | 38,438 | 4 / 1 | 12 | 2,206 | 3,082 | 110.94 | csim: TEST PASSED. Confirms PE_COUNT ≥ fadd latency (4) does not buy II=1: more parallel chains only shrinks `MACS_PER_PE` (so latency keeps dropping, 48,031→38,437) and costs more DSP (7→12), but II stays pinned at 4. Not kept — PE_COUNT=4 gets the same II at lower resource cost |
 
-**Architecture differences from C1/C3's baseline** (relevant to how the optimization arc will differ):
-- No sliding window — this is a dense matrix-vector multiply (400×120 weight matrix), so there's no line-buffer step to build; the eventual bottleneck diagnosis will likely center on the weight array's memory ports rather than an input/window array.
-- Activation is **ReLU** (updated 2026-09-03 from an initial tanh pass — see journal), matching `lenet5_relu.py`, same variant as C1/C3/S2. The dense stack now stays consistent with the convs end-to-end.
-- 400×120 = 48,000 weights, by far the largest weight array of any IP built so far (vs. C1's 150, C3's 2,400) — expect memory-port pressure to dominate the baseline bottleneck.
+**Bottleneck diagnosis — accumulator-limited, exactly like C3's baseline (not a memory-port issue):**
+Bind report shows a single scalar accumulator (`acc_2 = fadd(acc_1_load, mul)`, `FAddSub_fulldsp`, latency=4). The `input_r`/`weights` RAM loads already resolve at `<Latency=1><II=1>` on 2 ports — no port stall. II=5 = fadd latency(4) + 1 pipeline-overhead cycle, a pure loop-carried float-accumulator RAW dependency. `ARRAY_PARTITION` would have done nothing here, same conclusion as C1's pre-systolic baseline and C3's pre-split baseline.
 
-**Next step**: run C-simulation and baseline synthesis in Vitis HLS to fill in the row above, then diagnose the true bottleneck (weights array vs. input) before choosing a partitioning/streaming strategy.
+**Why PE_COUNT ≥ 4 doesn't reach II=1 (confirmed by directly comparing PE_COUNT=4 vs. 5):**
+`#pragma HLS UNROLL` over the PE dimension `p` puts all `PE_COUNT` partial-sum adds inside the *same* pipeline iteration (the `m` loop, trip count = `MACS_PER_PE`). That means any single `partial_sum[p]` is written once per `m`-iteration and read back on the very next `m`-iteration — a revisit gap of exactly 1 iteration, independent of `PE_COUNT`. Since 1 iteration lasts II cycles, the fadd's 4-cycle latency forces II≥4 regardless of how many parallel chains exist; more `PE_COUNT` only reduces `MACS_PER_PE` (fewer iterations → less total latency), it does not relax the per-chain recurrence. The only way to actually get a revisit gap of `PE_COUNT` iterations would be *temporal* round-robin (each PE only touched once every `PE_COUNT` iterations) instead of *spatial* unroll — which is exactly what `conv_c3_partialsum_roundrobin.cpp` tried for C3, and that hit a separate wall instead (variable array index defeats HLS's static dependence analysis, so it conservatively re-imposes the same II=4 anyway, on top of breaking loop flattening). Given that, PE_COUNT=6 was not run for C5 — by this same mechanism it would cost more DSP than PE_COUNT=4 for the identical II=4 floor.
+
+**Next step**: `dense_c5_partialsum.cpp` (PE_COUNT=4) is C5's optimized stage, matching C3's methodology. `ARRAY_PARTITION`/further memory-side optimization is not indicated — the remaining ceiling is the accumulation chain, not a port conflict.
 
 ## S2 Pooling — HLS Optimization Log (final, corrected)
 

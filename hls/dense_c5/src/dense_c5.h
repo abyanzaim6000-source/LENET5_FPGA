@@ -13,4 +13,11 @@ void dense_c5(
     float output[N_OUT]
 );
 
+void dense_c5_partialsum(
+    float input[N_IN],
+    float weights[N_IN][N_OUT],
+    float bias[N_OUT],
+    float output[N_OUT]
+);
+
 #endif
