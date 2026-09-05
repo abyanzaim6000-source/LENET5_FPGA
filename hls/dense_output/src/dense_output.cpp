@@ -63,7 +63,7 @@ void dense_output(
     float exp_vals[N_OUT];
     float sum_exp = 0;
     for (int j = 0; j < N_OUT; j++) {
-        exp_vals[j] = std::expf(logits[j] - max_logit);
+        exp_vals[j] = std::exp(logits[j] - max_logit);
         sum_exp += exp_vals[j];
     }
 

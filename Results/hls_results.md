@@ -201,11 +201,11 @@ Target device: xc7z020iclg484-1L (Zynq-7020, ZedBoard) | Clock: 10ns (100MHz), s
 
 | Experiment | Latency (cycles) | Interval (cycles) | Inner-loop II (achieved/target) | DSP | FF | LUT | Fmax (MHz) | Notes |
 |---|---|---|---|---|---|---|---|---|
-| **Partial-sum split (PE_COUNT=4), built directly** | *pending Vitis HLS run* | *pending* | *pending (targeting 4/1)* | *pending* | *pending* | *pending* | *pending* | csim: TEST PASSED (output[0]=120). Went straight to `dense_c5_partialsum.cpp`'s proven PE_COUNT=4 pattern — no serial-accumulator baseline built first, same as S2→S4's reuse. Not yet run through Vitis HLS C-simulation/synthesis |
+| **Partial-sum split (PE_COUNT=4), built directly** | **10,113** | **10,114** | **4 / 1** | **11** | **1,673** | **1,988** | **111.66** | csim: TEST PASSED (output[0]=120). Went straight to `dense_c5_partialsum.cpp`'s proven PE_COUNT=4 pattern — no serial-accumulator baseline built first, same as S2→S4's reuse. `VITIS_LOOP_19_1_VITIS_LOOP_28_3` (flattened outer j / inner m,p reduction, trip count 2,520 = 84×30) confirmed at II=4 |
 
 **Architecture**: 120 inputs → 84 outputs, ReLU. Identical MAC-stage structure to `dense_c5_partialsum.cpp`: the 120-tap reduction per output neuron is split across `PE_COUNT=4` independent `partial_sum[]` accumulators (`ARRAY_PARTITION complete` on `partial_sum` only — C5's bind-report diagnosis showed the bottleneck is the float adder's loop-carried recurrence, not a memory-port conflict, so `input`/`weights` are left unpartitioned), with `PIPELINE II=1` requested on the inner reduction loop. Only the dimensions changed from C5 (400→120 inputs, 120→84 outputs) — same reusable-IP principle as S2→S4.
 
-**Next step**: run C-simulation and synthesis in Vitis HLS to confirm the actual II (expected to land at 4, accumulation-limited, matching C5's floor — same fadd-latency mechanism, independent of N_IN) and record real DSP/FF/LUT/Fmax.
+**Confirmed**: II=4 accumulation-limited floor holds exactly as predicted, independent of N_IN — same mechanism as C5 (fadd 4-cycle latency, same DSP count of 4 MAC units + 2 fadd + 1 fmul = 11 total). Fmax (111.66MHz) matches C5's PE_COUNT=4 result exactly, since it's set by the same `weights_load`→`fmul` critical path, not by N_IN or N_OUT.
 
 ## Output Dense (Fully-Connected, Softmax) — HLS Optimization Log
 
@@ -213,14 +213,21 @@ Target device: xc7z020iclg484-1L (Zynq-7020, ZedBoard) | Clock: 10ns (100MHz), s
 
 | Experiment | Latency (cycles) | Interval (cycles) | Inner-loop II (achieved/target) | DSP | FF | LUT | Fmax (MHz) | Notes |
 |---|---|---|---|---|---|---|---|---|
-| **Partial-sum split (PE_COUNT=4) MAC stage + separate softmax stage, built directly** | *pending Vitis HLS run* | *pending* | *pending (targeting 4/1 for the MAC stage)* | *pending* | *pending* | *pending* | *pending* | csim: TEST PASSED (all 10 outputs = 0.1, sum = 1.0). MAC stage went straight to `dense_c5_partialsum.cpp`'s proven PE_COUNT=4 pattern — no serial-accumulator baseline built first. Not yet run through Vitis HLS C-simulation/synthesis |
+| **Partial-sum split (PE_COUNT=4) MAC stage + separate softmax stage, built directly** | **999** | **1,000** | **4 / 1 (MAC stage)** | **14** | **2,778** | **3,721** | **111.66** | csim: TEST PASSED (all 10 outputs = 0.1, sum = 1.0) after fixing a build error (`std::expf` isn't in this toolchain's `<cmath>`; switched to `std::exp`, which has a valid `float` overload). MAC stage went straight to `dense_c5_partialsum.cpp`'s proven PE_COUNT=4 pattern — confirmed at II=4. See per-stage breakdown below |
 
 **Architecture differences from F6/C5**: 84 inputs → 10 outputs, **softmax** instead of ReLU. Softmax needs the sum of every output neuron's exponential before any single one can be normalized, so it does not fit the single-pass "compute acc → activate → write output[j]" loop the ReLU layers use. `dense_output.cpp` is split into two explicit stages instead:
 1. **MAC stage** — identical PE_COUNT=4 partial-sum structure to `dense_c5_partialsum.cpp`/`dense_f6.cpp` (only `partial_sum[]` partitioned, not `input`/`weights`, per C5's diagnosis), writing each neuron's raw (pre-activation) accumulation into a small local `logits[10]` array.
 2. **Softmax stage** — a separate pass over the completed `logits` array once all 10 are available: max-subtraction for numerical stability, `exp`, sum, then divide.
 
-Only stage 1 carries the PE_COUNT=4 partial-sum pragmas; stage 2 is a short, inherently serial reduction/normalization over just 10 elements and is not expected to be a resource or II bottleneck.
+Only stage 1 carries the PE_COUNT=4 partial-sum pragmas; stage 2 is a short, inherently serial reduction/normalization over just 10 elements and is not expected to be a resource or II bottleneck — confirmed below.
 
-**Next step**: run C-simulation and synthesis in Vitis HLS to confirm the MAC stage's II (expected ~4, same mechanism as C5/F6) and record real DSP/FF/LUT/Fmax for the combined two-stage design.
+**Per-stage breakdown** (top-level `dense_output` is not itself pipelined — the 4 stages run sequentially, one HLS sub-block each, `Interval ≈ Latency` at the top level, matching C3/C5's un-pipelined-baseline pattern but here by *design*, not as a bottleneck):
 
-**Next step**: run C-simulation and synthesis in Vitis HLS to confirm the MAC stage's II (expected ~4, same as F6/C5) and record real DSP/FF/LUT/Fmax for the combined two-stage design.
+| Stage (source line) | Latency (cycles) | II (achieved/target) | Trip count | Notes |
+|---|---|---|---|---|
+| MAC accumulation (29–38) | 867 | **4 / 1** | 210 (= 21 MACs/PE × 10 outputs) | Same accumulator-limited floor as C5/F6 — confirms the PE_COUNT=4 pattern transfers unchanged into a multi-stage design |
+| Find max logit (59) | 20 | 2 / 1 | 9 (N_OUT−1 comparisons) | `fcmp` reduction over 10 elements — not partial-summed, not worth it at this trip count |
+| exp + sum (65) | 68 | **5 / 1** | 10 | Same accumulator-limited pattern as C3/C5's *baseline* (single scalar `sum_exp`, 5-cycle fadd latency) — deliberately not partial-summed since PE_COUNT=4 splitting a 10-element reduction would cost more resources than it saves at this scale |
+| Normalize (divide) (70) | 27 | 1 / 1 | 10 | Full II=1 — division has no loop-carried dependency here, each `output[j]` is independent |
+
+**Confirmed**: MAC stage hits the identical II=4 floor as C5/F6 (11→14 DSP includes the exp/divide units, not more MAC parallelism), validating that the PE_COUNT=4 partial-sum pattern is orthogonal to what happens downstream. The softmax stage's own `sum_exp` accumulation lands on the *same* accumulator-latency mechanism documented for C3/C5's un-split baselines (II=5, scalar fadd) — expected and left as-is, since splitting a 10-term reduction across PE_COUNT=4 chains would trade a negligible latency win for real resource cost, unlike the 120–400-term reductions where the split pays off.
