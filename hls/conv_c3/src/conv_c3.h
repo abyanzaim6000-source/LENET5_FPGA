@@ -18,6 +18,10 @@ void conv_c3(
     float output[OUT_H][OUT_W][OUT_C]
 );
 
+// SUPERSEDED -- see conv_c3_partialsum_lut.cpp below (same partial-sum
+// structure, division-free decode, same latency/II/Fmax at far lower
+// DSP/FF/LUT). Kept declared/buildable for the record; no longer called
+// from lenet5_top.cpp.
 void conv_c3_partialsum(
     float input[IN_H][IN_W][IN_C],
     float weights[K][K][IN_C][OUT_C],
@@ -25,7 +29,16 @@ void conv_c3_partialsum(
     float output[OUT_H][OUT_W][OUT_C]
 );
 
+// EXPLORED, REJECTED -- see Results/hls_results.md (breaks loop flattening).
 void conv_c3_partialsum_roundrobin(
+    float input[IN_H][IN_W][IN_C],
+    float weights[K][K][IN_C][OUT_C],
+    float bias[OUT_C],
+    float output[OUT_H][OUT_W][OUT_C]
+);
+
+// KEPT -- C3's current optimized stage, used by lenet5_top.cpp.
+void conv_c3_partialsum_lut(
     float input[IN_H][IN_W][IN_C],
     float weights[K][K][IN_C][OUT_C],
     float bias[OUT_C],

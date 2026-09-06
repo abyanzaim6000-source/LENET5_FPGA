@@ -8,6 +8,9 @@ hls/**/dense_c5_partialsum_proj/
 hls/**/dense_c5_partialsum5_proj/
 hls/**/dense_f6_proj/
 hls/**/dense_output_proj/
+hls/**/conv_c3_partialsum_lut_proj/
+hls/**/lenet5_top_proj/
+hls/**/lenet5_top_dataflow_proj/
 weights/
 
 # Vivado generated files
