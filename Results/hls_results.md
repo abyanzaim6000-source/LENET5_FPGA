@@ -133,10 +133,13 @@ All 4 II-violation warnings (attempted II=1 through II=4) trace to the same caus
 - Padding is "valid", not "same" — no boundary zero-checks, so the line-buffer variant won't need the padding-validity logic that C1's did.
 - Output is 10×10×16 (vs C1's 28×28×6) — smaller spatial extent, more output channels. Confirmed: the true bottleneck is **not** the `input`/`weights` arrays at all (unlike C1's baseline) — it's the serial floating-point accumulation chain.
 
-| **KEPT — Partial-sum split (PE_COUNT=6, mac_idx decode)**, `conv_c3_partialsum.cpp` | **160,078** | **160,079** | **4 / 1** | **45** | **41,020** | **31,870** | **0** | **111.66** | csim: TEST PASSED. Same `partial_sum[PE_COUNT]` pattern as `conv_c1_systolic.cpp`: 150-term reduction (IN_C×K×K = 6×5×5) split across 6 independent accumulator chains (25 terms each), combined at the end. HLS auto-flattened the outer o/r/c loops into the pipeline (trip count 40,000 = 1,600×25). Latency dropped ~7.66x vs. baseline. II only improved 5→4 (still not 1) — same accumulator-latency floor as C1's PE_COUNT=8 case (Final II=4 there too). Most of the DSP/FF growth (33 of 45 DSP; `urem_*` modules ~2,100-2,300 FF each ×16) comes from decoding the flattened `mac_idx` back into `(i,kr,kc)` via `/`/`%` by K=5 (non-power-of-2), not from the MAC math itself — see the rejected div/mod-free attempt below for why that overhead was kept rather than removed. **This is the version kept as C3's optimized stage** — it's the only one of the two fix attempts that clears the 100MHz-class timing target |
+| **SUPERSEDED — see LUT-decode version below — Partial-sum split (PE_COUNT=6, mac_idx decode)**, `conv_c3_partialsum.cpp` | 160,078 | 160,079 | 4 / 1 | 45 | 41,020 | 31,870 | 0 | 111.66 | csim: TEST PASSED. Same `partial_sum[PE_COUNT]` pattern as `conv_c1_systolic.cpp`: 150-term reduction (IN_C×K×K = 6×5×5) split across 6 independent accumulator chains (25 terms each), combined at the end. HLS auto-flattened the outer o/r/c loops into the pipeline (trip count 40,000 = 1,600×25). Latency dropped ~7.66x vs. baseline. II only improved 5→4 (still not 1) — same accumulator-latency floor as C1's PE_COUNT=8 case (Final II=4 there too). Most of the DSP/FF growth (33 of 45 DSP; `urem_*` modules ~2,100-2,300 FF each ×16) comes from decoding the flattened `mac_idx` back into `(i,kr,kc)` via `/`/`%` by K=5 (non-power-of-2), not from the MAC math itself. **Superseded** by `conv_c3_partialsum_lut.cpp` (same latency/II/Fmax, far lower DSP/FF/LUT) — no longer called from `lenet5_top.cpp`; kept in the repo and buildable for the record |
 | **EXPLORED, REJECTED — div/mod-free round-robin**, `conv_c3_partialsum_roundrobin.cpp` | 1,030,401 | 1,030,402 | 4 / 1 | 5 | 964 | 2,050 | 0 | **93.03** | csim: TEST PASSED. Attempted to remove the div/mod overhead above by using natural nested `i`/`kr`/`kc` loops (zero decode cost) and an increment-and-wrap counter (compare+reset, not a divider) to pick which of `PE_COUNT` partial-sum registers each term hits. **It works**: DSP/FF/LUT drop back to near-baseline levels (DSP 45→5, FF 41,020→964, LUT 31,870→2,050), confirming the div/mod was indeed the dominant resource cost, not the MACs. **But** the `pe`-counter's compare/reset in the loop latch breaks the "perfect loop nest" property HLS needs to auto-flatten o/r/c into the pipeline (log: "Cannot flatten loop ... the outer loop is not a perfect loop because there is nontrivial logic in the loop latch") — so the 150-iteration inner pipeline now drains/refills separately 1,600 times with zero overlap, making overall latency ~6.4x **worse** than the kept version above (still ~16% better than the un-split baseline). Fmax also fell to 93.03MHz, missing the 100MHz-class target — the `pe`-select mux landed on the same critical path as `input_r_load`→`fmul`. Kept in the repo and documented here (not deleted) as a real cost/latency trade worth revisiting, mirroring how C1's rejected intermediate attempts (forced-full-unroll bug, 150-port AXI explosion) were kept visible in this log rather than erased |
+| **KEPT — LUT-based mac_idx decode**, `conv_c3_partialsum_lut.cpp` | **160,047** | 160,048 | 4 / 1 | **12** | **3,013** | **6,250** | 0 | **111.66** | csim: TEST PASSED (uniform-value corner check + a second cross-check against `conv_c3_partialsum.cpp` using distinct per-`(kr,kc,i)` weights, max diff 0). Keeps `conv_c3_partialsum.cpp`'s exact flattened `mac_idx = m*PE_COUNT+p` loop structure (same `m`/`p` loops, same `#pragma HLS PIPELINE II=1` placement) — only the decode changes: `i`/`kr`/`kc` come from three `ARRAY_PARTITION complete` 150-entry constant tables (`i_lut`, `kr_lut`, `kc_lut`) indexed by `mac_idx`, instead of `/`/`%` by K=5. Synthesis log shows the identical three `Flattening a loop nest` INFO messages as the previously-kept version, and the loop report confirms it: `VITIS_LOOP_57_1_VITIS_LOOP_59_3_VITIS_LOOP_66_5`, trip count 40,000, Pipelined=yes, II achieved=4 — same accumulator-latency floor, same Fmax (111.66MHz), latency effectively unchanged (160,047 vs 160,078). Resource cost dropped sharply: DSP 45→12 (-73%), FF 41,020→3,013 (-93%), LUT 31,870→6,250 (-80%) — the `urem_*` dividers are gone, replaced by small `mux_255_32_1_1` lookup muxes (17 instances, ~113 LUT each) reading the partitioned tables. **This gets both properties the round-robin attempt couldn't combine: division-free decode AND preserved loop flattening/timing** — it strictly dominates the previous version on DSP/FF/LUT at equal latency/II/Fmax. **Promoted to C3's optimized stage; `lenet5_top.cpp` now calls this version** |
 
-**Next step**: `conv_c3_partialsum.cpp` (PE_COUNT=6, mac_idx decode) is C3's current optimized stage. Continue C1's methodology from here: `ARRAY_PARTITION` on `input`/`weights`, then line buffer → systolic PE variant → AXI conversion. The div/mod-free approach could be revisited later if the outer-loop flattening can be recovered without reintroducing division (e.g. static PE offsets instead of one runtime counter), but isn't blocking further progress.
+**Correction to this log's own C1 comparisons above**: several notes here (and in C1's own log) describe `conv_c3_partialsum.cpp`'s `partial_sum[PE_COUNT]`/`mac_idx` pattern as "the same pattern as `conv_c1_systolic.cpp`" — that's accurate only in that both use flattened-`mac_idx`-decoded-via-`/`-and-`%`. Checked against every commit that ever touched `conv_c1_systolic.cpp` (from its first commit `905d876` onward): C1 has never had a division-free, direct-nested-loop `(kr,kc,i)` variant with a loop-counter PE assignment — that structure only ever existed as `conv_c3_partialsum_roundrobin.cpp` above (the rejected one). C1 accepted the same division cost C3 did; it never solved the div-vs-flattening tradeoff either. The LUT-based row above is the first variant (C1 or C3) to get both.
+
+**Next step**: `conv_c3_partialsum_lut.cpp` (PE_COUNT=6, LUT-based decode) is now C3's optimized stage, promoted in place of `conv_c3_partialsum.cpp`. Continue C1's methodology from here: `ARRAY_PARTITION` on `input`/`weights`, then line buffer → systolic PE variant → AXI conversion.
 
 
 
@@ -231,3 +234,102 @@ Only stage 1 carries the PE_COUNT=4 partial-sum pragmas; stage 2 is a short, inh
 | Normalize (divide) (70) | 27 | 1 / 1 | 10 | Full II=1 — division has no loop-carried dependency here, each `output[j]` is independent |
 
 **Confirmed**: MAC stage hits the identical II=4 floor as C5/F6 (11→14 DSP includes the exp/divide units, not more MAC parallelism), validating that the PE_COUNT=4 partial-sum pattern is orthogonal to what happens downstream. The softmax stage's own `sum_exp` accumulation lands on the *same* accumulator-latency mechanism documented for C3/C5's un-split baselines (II=5, scalar fadd) — expected and left as-is, since splitting a 10-term reduction across PE_COUNT=4 chains would trade a negligible latency win for real resource cost, unlike the 120–400-term reductions where the split pays off.
+
+## LeNet-5 Combined Top-Level — HLS Optimization Log
+
+Target device: xc7z020iclg484-1L (Zynq-7020, ZedBoard) | Clock: 10ns (100MHz), same as every layer above. `hls/lenet5_top/`: `lenet5_top()` chains all 7 proven layer IPs (conv_c1_systolic → pool_s2 → conv_c3_partialsum → pool_s4 → dense_c5_partialsum → dense_f6 → dense_output) into one forward pass, with the same `m_axi`/`s_axilite` + local-buffer-burst-copy interface style as `conv_c1_systolic.cpp`.
+
+**Test data**: real MNIST test[0] image + real trained weights pulled directly out of `Models/lenet5_relu.keras` (loaded via `h5py` against the `.keras` archive's `model.weights.h5`, since TensorFlow isn't installed in this environment — weight arrays are matched to layers by shape, which is unambiguous here: no two layers share a shape). Reference forward pass computed with the project's own `manual_layers.py` (the same math `manual_inference_relu.py` uses). Generator script: `hls/lenet5_top/tb/generate_test_data.py`, output: `hls/lenet5_top/tb/lenet5_test_data.h`.
+
+**C-simulation: TEST PASSED** (both the primary and the explored-and-reverted DATAFLOW variant give this same result). HLS output matches the Python/NumPy reference to within 6.5e-11 (float rounding from a different accumulation order — the partial-sum split reduces in a different term order than NumPy's sequential sum), sums to 1.0, and both agree on predicted class 7 — which also matches the true MNIST label:
+
+| | class 0 | 1 | 2 | 3 | 4 | 5 | **6** | **7** | 8 | 9 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| HLS | 4.49e-9 | 7.52e-7 | 2.59e-6 | 7.63e-5 | 6.46e-12 | 3.24e-7 | 1.15e-11 | **0.99992** | 8.77e-8 | 4.49e-8 |
+| Python ref | 4.49e-9 | 7.52e-7 | 2.59e-6 | 7.63e-5 | 6.46e-12 | 3.24e-7 | 1.15e-11 | **0.99992** | 8.77e-8 | 4.49e-8 |
+
+**Build issue hit and fixed before synthesis first succeeded** — bundling all 10 weight/bias arrays under one shared `m_axi` bundle (`gmem_wgt`) failed csynth with `ERROR: [HLS 200-1013] Bundled bus interface gmem_wgt failed dataflow checking: it cannot read data in multiple processes` — DATAFLOW turns each burst-copy-in loop into its own concurrent hardware process, and two concurrent processes can't share one AXI port. Fix: one `m_axi` bundle per array (12 total: image, 5×weights, 5×bias, result) — actually the more faithful reading of `conv_c1_systolic.cpp`'s own style (it already gives `input`/`weights`/`bias`/`output` four separate bundles). Kept in the primary version below even though it's no longer strictly required without DATAFLOW.
+
+### EXPLORED, REVERTED — `#pragma HLS DATAFLOW` for image-to-image pipelining (`lenet5_top_dataflow.cpp`)
+
+Exceeds chip capacity due to weight double-buffering — reverted, not carried forward as the active design. Kept in the repo (`hls/lenet5_top/src/lenet5_top_dataflow.cpp`, `run_hls_dataflow.tcl`, `tb/lenet5_top_dataflow_tb.cpp`) as a real, independently-reproducible exploration, same convention as `conv_c3_partialsum_roundrobin.cpp`.
+
+| Metric | Value | Available | Utilization |
+|---|---|---|---|
+| Latency (one image, cold) | 505,400 cycles (5.054 ms) | — | — |
+| Interval (steady-state, pipelined across images) | 291,202 cycles (2.912 ms) | — | — |
+| Fmax | 103.49 MHz | — | clears 100MHz target |
+| DSP | 84 | 220 | 38% |
+| FF | 83,080 | 106,400 | 78% |
+| **LUT** | **74,562** | **53,200** | **140% — OVER BUDGET** |
+| **BRAM_18K** | **444** | **280** | **158% — OVER BUDGET** |
+
+**Findings:**
+
+1. **DATAFLOW *did* deliver on its purpose** — Interval (291,202) < total Latency (505,400), confirming successive images really can start before the previous one finishes, gated by the single slowest stage.
+2. **`BRAM_18K` and `LUT` are genuinely over the xc7z020's budget**, meaning this design would fail Vivado place-and-route even though Vitis HLS's csynth step reports success (csynth only generates + estimates RTL, it doesn't check placement). Root cause, confirmed in the synthesis log's `PIPO` messages: DATAFLOW requires every buffer that crosses a producer/consumer boundary to support double-buffering (ping-pong) so the next image's producer can write while the current image's consumer still reads — e.g. `local_c3_weights` gets built "using a separate memory for each block" (i.e. doubled), and the same happens to several of the large inter-layer feature-map buffers. This cost is fundamentally reasonable for the *small, per-image* feature-map buffers DATAFLOW is meant to double-buffer — but the *weight* arrays (which don't change per image at all) pay the same double-buffering tax purely because their burst-copy-in loop lives inside the same DATAFLOW region as everything else.
+3. `conv_c3_partialsum`'s instance latency here (291,201 cycles) is nearly double its standalone number (160,078 cycles). **Correction to an earlier read of this**: re-running the exact same C3 regression appears in the *non*-DATAFLOW primary version below too (see its finding #1) — so this is NOT a DATAFLOW-specific cost, it's a general consequence of C3 being called as a sub-function at all. Left in this table for completeness since it's still true of this build, but the diagnosis belongs to the primary version's write-up, not to DATAFLOW.
+
+**Follow-ups if image-to-image pipelining is revisited**: move the weight burst-copy-in loops outside the DATAFLOW region (weights only need loading once per bitstream load, not double-buffered per image) — would likely remove most of the BRAM overshoot on its own.
+
+### PRIMARY WORKING BASELINE — sequential, no DATAFLOW (`lenet5_top.cpp`)
+
+Same 7-layer chain, same AXI/burst-copy interface, `#pragma HLS DATAFLOW` removed: image N fully completes (including all weight/image copy-in) before image N+1 starts. C-simulation re-confirmed TEST PASSED (identical numeric result to the table above — removing DATAFLOW doesn't change the math, only the scheduling).
+
+| Metric | Value | Available | Utilization |
+|---|---|---|---|
+| Latency = Interval (fully sequential, no overlap) | 552,617 cycles (5.526 ms) | — | — |
+| Fmax | 103.49 MHz | — | clears 100MHz target |
+| DSP | 57 | 220 | 25% |
+| FF | 80,961 | 106,400 | 76% |
+| BRAM_18K | 232 | 280 | **82% — fits** |
+| **LUT** | **70,151** | **53,200** | **131% — still OVER BUDGET** |
+
+**Findings:**
+
+1. **Removing DATAFLOW fixed BRAM (158%→82%) but NOT LUT (140%→131%, still over).** Confirms the double-buffering diagnosis above was correct and was the dominant BRAM cost — without DATAFLOW, every buffer is single-buffered again (`local_c3_weights` etc. now show a single memory, not a doubled pair), and BRAM_18K usage nearly halved (444→232) even though the arrays themselves didn't shrink.
+2. **`conv_c3_partialsum`'s latency is STILL ~291,201 cycles here, identical to the DATAFLOW build**, confirming (see correction above) this has nothing to do with DATAFLOW: its own sub-report inside this build still shows the outer `o`/`r`/`c` loop (trip count 1,600) as `Pipelined: no`, each outer iteration paying its own ~182-cycle call overhead into the inner PE_COUNT=6 pipeline (1,600 × 182 ≈ 291,200) instead of the one continuous 40,000-iteration flattened pipeline C3 gets when it's its own top-level function. This single stage is 53% of total latency (291,201 / 552,617) — the clear next lever for latency, independent of the DATAFLOW question. Not fixed here since it wasn't asked for this pass.
+3. **LUT is still over budget, and the cause is additive, not a single culprit**: `conv_c3_partialsum` alone costs 29,514 LUT (mostly its documented `mac_idx` div/mod decode overhead, already flagged as an accepted cost in C3's own optimization log above), `conv_c1_systolic` costs 12,171, `dense_output` 2,500, and the 12 per-array `m_axi` adapters cost 1,318 LUT each = 15,816 total — that last number is now a proportionally bigger factor than it was in the DATAFLOW build, because BRAM dropped but LUT didn't, so the fixed per-bundle AXI overhead (unaffected by DATAFLOW either way) is more exposed as a real, unavoidable-at-12-bundles cost.
+
+**Not attempted this pass** (real next steps, not silently applied): consolidating some of the 12 AXI bundles (e.g. one shared bundle per *layer* — weights+bias together — instead of one per array) would cut AXI adapter LUT roughly in half without reintroducing the DATAFLOW multi-process-per-bundle conflict, since this version has no concurrent processes; and addressing C3's lost loop-flattening (independent of DATAFLOW, confirmed above) would cut both latency and, likely, LUT (fewer redundant control-path copies of the inner pipeline's start/stop logic per outer iteration). Neither was applied here — this is reported as the actual, unedited synthesis result of "remove DATAFLOW, re-verify, report," exactly as asked.
+
+### AXI bundle consolidation — 7 bundles instead of 12 (`lenet5_top.cpp`, current)
+
+Confirmed before making the change: the DATAFLOW multi-process-per-bundle conflict (line 248 above) cannot recur here — that error only occurs when DATAFLOW splits each burst-copy loop into its own concurrent hardware process; this primary version has no `#pragma HLS DATAFLOW` and never did, so there is exactly one process reading/writing each AXI port regardless of bundling. Changed the 12 per-array `m_axi` bundles to 7: one shared bundle per layer's weights+bias pair (`gmem_c1`, `gmem_c3`, `gmem_c5`, `gmem_f6`, `gmem_out` for output_weights+output_bias) plus the network's own I/O kept separate (`gmem_img` for `image`, `gmem_res` for `result`). C-simulation re-confirmed TEST PASSED (bundling is an interface-only change, doesn't touch the math). C-synthesis succeeded with no dataflow-checking errors.
+
+| Metric | Value | Available | Utilization |
+|---|---|---|---|
+| Latency = Interval | 552,749 cycles (5.527 ms) | — | — (unchanged, interface-only change) |
+| Fmax | 103.49 MHz | — | clears 100MHz target |
+| DSP | 57 | 220 | 25% |
+| FF | 77,380 | 106,400 | 72% |
+| BRAM_18K | 232 | 280 | 82% — fits |
+| **LUT** | **63,478** | **53,200** | **119% — still OVER BUDGET, improved from 131%** |
+
+**Findings:**
+
+1. **Confirmed the AXI-adapter-count hypothesis directly**: each `m_axi` adapter (`gmem_*_m_axi_U` in the Instance report) costs a fixed 1,318 LUT regardless of how many arrays share it. 12→7 bundles cut adapter LUT from 15,816 to 9,226 (−6,590), and total design LUT dropped 70,151→63,478 (−6,673, the extra ~83 from small mux/routing changes elsewhere).
+2. **This alone does not get the design under budget.** 63,478 / 53,200 = 119% — still 10,278 LUT over. The two dominant non-AXI costs are unchanged and now proportionally larger: `conv_c3_partialsum` alone is 29,514 LUT and `conv_c1_systolic` 12,171 LUT (together 65% of total design LUT), both pre-existing costs from each layer's own accepted optimization trade-offs (C3's `mac_idx` div/mod decode, documented in its own log above).
+3. Going to fewer than 7 bundles (e.g. merging `gmem_img`/`gmem_res` in with a layer bundle, or all weights into one bundle) would save at most another ~2,636 LUT (2 more adapters removed) — not enough on its own to close a 10,278-LUT gap. **Getting under 53,200 LUT requires addressing C3 and/or C1's own resource cost, not further bundle consolidation.**
+
+**Not attempted this pass**: C3's lost loop-flattening (latency-only per the original ask, tracked separately above) and any reduction of C3/C1's own LUT footprint (e.g. revisiting `mac_idx` decode or PE_COUNT) — out of scope for "AXI bundle consolidation only," reported here as the honest result of that change in isolation.
+
+### C3 LUT-decode swap — `conv_c3_partialsum_lut.cpp` promoted in place of `conv_c3_partialsum.cpp` (`lenet5_top.cpp`, current)
+
+Directly addresses finding #2/#3 above ("Getting under 53,200 LUT requires addressing C3 and/or C1's own resource cost"). `lenet5_top.cpp`'s forward declaration and its one call site were switched from `conv_c3_partialsum` to `conv_c3_partialsum_lut` (see C3's own log above for that IP's division-free `mac_idx` decode). No other change — same 7-bundle AXI interface, same DATAFLOW-free sequential scheduling. C-simulation re-confirmed TEST PASSED against the same real-MNIST/real-weights reference (predicted class 7, matches true label, max abs diff vs. Python reference 6.55e-11 — identical to every prior build, since swapping C3's decode implementation doesn't change the math). C-synthesis succeeded.
+
+| Metric | Value | Available | Utilization |
+|---|---|---|---|
+| Latency = Interval | 496,750 cycles (4.967 ms) | — | ~10% faster than the 552,749-cycle pre-swap build |
+| Fmax | 103.49 MHz | — | clears 100MHz target |
+| DSP | 24 | 220 | 11% |
+| FF | 39,688 | 106,400 | 37% |
+| BRAM_18K | 232 | 280 | 82% — fits |
+| **LUT** | **37,974** | **53,200** | **71% — UNDER BUDGET** |
+
+**This is the first build of the full 7-layer design to fit the xc7z020's LUT budget.** Confirms both open findings above directly:
+- `conv_c3_partialsum_lut`'s own instance cost inside this build is 4,010 LUT — down from `conv_c3_partialsum`'s 29,514 LUT in the identical position (−86%), consistent with (in fact even better than) the division-free decode's standalone win documented in C3's own log.
+- Total design LUT dropped 63,478 → 37,974 (−25,504, 40%), taking utilization from 119% (over budget) to 71%. DSP and FF also dropped sharply (57→24 DSP, 77,380→39,688 FF) since the `urem_*` divider logic is gone from the design entirely, not just resource-shared away.
+- Latency improved too (552,749→496,749 cycles, ~10% faster) even though C3 still loses its standalone loop-flattening when called as a sub-function here (same `Pipelined: no` outer-loop situation noted in the pre-swap findings) — the win is purely from removing the division critical-path/area cost, not from recovering flattening.
+
+`conv_c1_systolic` (12,171 LUT) is now the largest single-layer LUT cost in the design, and the 7 AXI adapters remain a fixed ~9,226 LUT overhead — both are legitimate next levers if further margin is wanted, but are not required to meet the 53,200 budget.
