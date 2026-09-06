@@ -1,16 +1,13 @@
+# Vitis HLS / Vivado generated project directories, wherever they land in
+# the repo (hls/, Lenet5_fpga_top/, or anywhere else a project gets created).
+# Matches by substring, not just a "_proj" suffix, since project names
+# haven't always been consistent (e.g. "pool_proj_s1" vs "pool_s4_proj").
+**/*proj*/
+
 venv/
 _pycache_/
 *.pyc
 .DS_Store
-hls/**/conv_c1_proj/
-hls/**/dense_c5_proj/
-hls/**/dense_c5_partialsum_proj/
-hls/**/dense_c5_partialsum5_proj/
-hls/**/dense_f6_proj/
-hls/**/dense_output_proj/
-hls/**/conv_c3_partialsum_lut_proj/
-hls/**/lenet5_top_proj/
-hls/**/lenet5_top_dataflow_proj/
 weights/
 
 # Vivado generated files
@@ -27,4 +24,3 @@ weights/
 # Nested duplicate clone / HLS temp
 LENET5_FPGA/
 Lenet5_fpga_top/*.xpr.lock
-hls/**/conv_c1_proj/**/impl/
