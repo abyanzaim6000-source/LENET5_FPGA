@@ -333,3 +333,214 @@ Directly addresses finding #2/#3 above ("Getting under 53,200 LUT requires addre
 - Latency improved too (552,749→496,749 cycles, ~10% faster) even though C3 still loses its standalone loop-flattening when called as a sub-function here (same `Pipelined: no` outer-loop situation noted in the pre-swap findings) — the win is purely from removing the division critical-path/area cost, not from recovering flattening.
 
 `conv_c1_systolic` (12,171 LUT) is now the largest single-layer LUT cost in the design, and the 7 AXI adapters remain a fixed ~9,226 LUT overhead — both are legitimate next levers if further margin is wanted, but are not required to meet the 53,200 budget.
+
+
+
+## C1 Convolution — INT8 Quantization (new, PYNQ-Z2 target)
+
+Project guide's next requirement: convert the HLS design from float32 to INT8 (weights and activations) with INT32 accumulation, starting with C1 only — C3, pooling, and dense stay float32 for now. Target board for this work: **PYNQ-Z2** (`xc7z020clg400-1`), a new part from the `xc7z020iclg484-1L`/`xc7z020clg484-1` target used for every float32 IP above (same Zynq-7020 die, different package/speed grade — resource counts are directly comparable, but note the part isn't identical when reading the numbers below).
+
+**Files added (all new — no existing float32 file touched, same "old version stays untouched as reference" convention as `conv_c1.cpp` vs `conv_c1_systolic.cpp`):**
+- `hls/conv_c1/src/conv_c1_int8.h`, `hls/conv_c1/src/conv_c1_int8.cpp` — new IP
+- `hls/conv_c1/tb/conv_c1_int8_tb.cpp`, `hls/conv_c1/tb/generate_test_data_int8.py`, `hls/conv_c1/tb/conv_c1_int8_test_data.h` — new testbench + golden-data generator
+- `hls/conv_c1/run_hls_int8_pynqz2.tcl` — new build script, new solution (`conv_c1_int8_proj`), part `xc7z020clg400-1`
+
+**Architecture**: deliberately the *same* systolic PE-array design as `conv_c1_systolic.cpp` (PE_COUNT=8, line buffer, `m_axi`×4 + `s_axilite` interfaces, burst-copy into partitioned local on-chip buffers) — only the datapath changes, so the float32-vs-int8 utilization comparison below isolates the effect of the numeric representation, not the architecture. `input`/`weights`/`output` are `ap_int<8>`, the MAC accumulator (`acc`, `partial_sum[]`) is `ap_int<32>`, and `bias` is `ap_int<32>`, PRE-quantized in software as `round(bias_float / (x_scale*w_scale))` (matching `conv2d_int()`'s own bias handling, just computed once ahead of time instead of re-derived via float division inside the datapath every call). `x_scale`, `w_scale`, `out_scale` are passed in as separate `float` scalar parameters (AXI-Lite registers), per the project guide's requirement to keep scale factors separate from the integer data.
+
+**Data flow, matching `src/integer_layers.py`'s proven `conv2d_int()` exactly**: int8 input × int8 weight accumulated into int32 (`acc`), then a single dequantize→ReLU→requantize step per output pixel:
+```
+dequant = (float)acc * (x_scale * w_scale)   // conv2d_int()'s acc*combined_scale
+dequant = max(0, dequant)                     // relu()
+requant = round(dequant / out_scale)          // quantize_activation(), round-half-away-from-zero
+output  = saturate(requant, -128, 127)
+```
+`out_scale` is this layer's own output-activation scale, produced by `quantize_activation()` applied to the ReLU'd float output — exactly how `integer_inference.py`'s real int8 forward pass determines every layer's next-stage input scale.
+
+**Test data**: real int8-quantized weights from `models/lenet5_relu.keras`'s C1 layer (via `quantize_int_real()`, `src/quantization.py`, as explicitly requested) and a real int8-quantized MNIST test[0] image (via `quantize_activation()`, `src/integer_layers.py`). Generator: `hls/conv_c1/tb/generate_test_data_int8.py`, output: `hls/conv_c1/tb/conv_c1_int8_test_data.h`. The one deliberate departure from calling `quantize_activation()` for the final output requantization is round-half-**away**-from-zero (matching the HLS hardware's `x>=0 ? +0.5 : -0.5` rounding) instead of NumPy's round-half-to-**even** — the two only disagree exactly at `x.5000...` boundaries, which don't occur with real trained-model floating-point data, so this doesn't change which reference is being matched, only makes the rounding rule explicit and bit-reproducible in C++.
+
+**C-simulation: TEST PASSED — exact match, not just close.**
+```
+Total output elements: 4704
+Mismatches: 0
+Max abs diff: 0
+TEST PASSED -- HLS INT8 output matches Python int8 reference exactly
+```
+Every one of the 4,704 output values (28×28×6) is bit-for-bit identical to the Python `conv2d_int()`+`relu()`+requantize reference — integer equality, not a floating-point tolerance.
+
+**C-synthesis: succeeded, all requested `PIPELINE` constraints satisfied.**
+
+### Utilization — float32 (`conv_c1_systolic`) vs int8 (`conv_c1_int8`)
+
+| Metric | float32 (`conv_c1_systolic`, `xc7z020iclg484-1L`) | int8 (`conv_c1_int8`, `xc7z020clg400-1`, PYNQ-Z2) | Change |
+|---|---|---|---|
+| BRAM_18K | 18 (6%) | **5 (1%)** | **−72%** |
+| DSP | 14 (6%) | 13 (5%) | −7% |
+| FF | 28,886 (27%) | **9,989 (9%)** | **−65%** |
+| LUT | 19,572 (36%) | **16,519 (31%)** | **−16%** |
+| Latency (cycles) | 144,591 | 280,223 | **+94% (worse)** |
+| Timing (at 10ns/100MHz target) | Slack **−2.36ns** (violated) | Slack **0.00ns** (met) | int8 closes timing, float32 doesn't |
+| Estimated Fmax | 104.80 MHz | **136.99 MHz** | +31% |
+
+**Findings:**
+
+1. **BRAM/FF/LUT all drop substantially, DSP is roughly flat.** BRAM falls the most (−72%) since 8-bit local buffers need far less on-chip memory than 32-bit float ones; FF falls sharply (−65%) because the 150-term MAC reduction's operands and pipeline registers are 8/32-bit integers instead of 32-bit floats carrying implicit exponent/mantissa/rounding logic through every pipeline stage. DSP stays close (14→13): both versions still map their 8-lane MAC array onto DSP48 multiply-accumulate primitives (`fmul`/`fadd` for float32, `mac_muladd_8s_8s_32s` for int8) at essentially 1:1 DSP-per-lane, so switching numeric representation doesn't change *how many* MAC lanes exist, only what's inside each one.
+
+2. **Latency got WORSE (144,591 → 280,223 cycles, +94%), and the cause is a genuinely new bottleneck, not a regression in the MAC array itself.** The int8 MAC reduction loop (`VITIS_LOOP_106_24`) still hits the target `II=1` pipeline, same as float32's equivalent inner loop. The regression is entirely in the *new* per-pixel dequantize→ReLU→requantize step this design didn't need before: `requant = dequant / out_scale` is a genuine floating-point division (`fdiv_32ns_32ns_32_16_no_dsp_1`, 15-cycle latency — see the Bind Op Report), on top of the dequantize multiply (`fmul`, 3 cycles). In `conv_c1_systolic.cpp`, ReLU was a free same-cycle comparison (`acc > 0 ? acc : 0`) fused into the already-pipelined accumulation; here, ReLU is cheap (an `if (dequant < 0)` on the *already-computed* float, no extra latency) but the surrounding fmul+fdiv chain is not, and having to complete it once per (row, col, channel) — inside the `o` loop, per-channel, not shared across channels — is expensive enough that HLS could not flatten the `o` loop into the MAC pipeline the way it flattened the analogous 24-trip `o`×`m` loop in `conv_c1_systolic` (compare: float32's per-pixel-across-all-6-channels reduction+activation completes in 145 cycles; int8's completes in 318 cycles across those same 6 channels, `VITIS_LOOP_101_22`, `Pipelined: no`).
+
+3. **int8 closes timing where float32 doesn't** (0.00ns slack vs −2.36ns at the 10ns/100MHz constraint; Estimated Fmax 136.99MHz vs 104.80MHz). Pure-integer MAC/compare logic has a materially shorter critical path than the pipelined floating-point MAC+comparison chain the systolic PE array uses in `conv_c1_systolic.cpp` — consistent with this project's own earlier finding (C1's own optimization log above) that the float `fadd`'s multi-cycle latency was *already* the accumulation bottleneck for the un-split baseline; int8 doesn't carry that same floating-point critical-path cost in its MAC array, even though it now carries a *different* one (the fdiv) at the activation boundary.
+
+4. **Not attempted this pass**: the `fdiv` is the obvious next lever if C1-int8's latency needs to come down — replacing `dequant / out_scale` with a precomputed `dequant * (1.0f / out_scale)` would trade the 15-cycle divide for a 3-cycle multiply and a single one-time reciprocal, likely recovering most or all of the +94% latency regression. This was deliberately **not** applied here: it changes the floating-point operation (`a/b` is not bit-identical to `a*(1/b)` in IEEE754 in general), which would need the Python reference regenerated the same way to keep the exact bit-for-bit match this pass achieved — out of scope for "get INT8 C1 correct and report its numbers as they stand," reported here as a real, concrete next step rather than silently applied.
+
+**Next step**: this validates the INT8 data flow and quantization approach end-to-end for one layer. Extending to C3 (the guide's own next-named layer) can reuse this exact pattern — `ap_int<8>`/`ap_int<32>` datapath, pre-quantized int32 bias, `x_scale`/`w_scale`/`out_scale` as separate float parameters, dequantize→ReLU→requantize per output pixel — and should hit the same reciprocal-multiply latency lever if it reuses the direct `fdiv` as a starting baseline.
+
+### Follow-up — reciprocal-multiply requantization (`conv_c1_int8.cpp`, current)
+
+Applied the lever identified above: `float inv_out_scale = 1.0f / out_scale;` is now computed ONCE (loop-invariant, before the row/col/channel loop nest), and the per-pixel requantization step is `requant = dequant * inv_out_scale` instead of `requant = dequant / out_scale`. Only one division now exists in the whole design (computed once per call), instead of one per output pixel (4,704 times).
+
+**Bit-exactness was checked, not assumed** — `a/b` is not always bit-identical to `a*(1/b)` in IEEE754 float32, so the Python golden reference (`generate_test_data_int8.py`) was regenerated to requantize the same way (`relu_out * inv_out_scale`, `inv_out_scale = np.float32(1.0)/out_scale`), and the two arithmetic paths were compared directly before trusting either:
+
+| Check | Result |
+|---|---|
+| Raw float `requant` values that differ between `a/b` and `a*(1/b)` | **530 / 4,704** elements differ (max abs diff 7.63e-06) |
+| Of those, how many land in a **different int8 bucket** after round+saturate | **0 / 4,704** |
+
+So the two arithmetic paths genuinely do diverge at the float level on this real data (not a no-op change) — they just happen not to cross a rounding boundary anywhere in this particular image/weight set. That's a property of this data, not a guarantee; re-verifying via C-simulation (not just this offline NumPy check) is what actually confirms the HLS kernel itself is still correct.
+
+**C-simulation, re-run against the regenerated reference: still an exact match.**
+```
+Total output elements: 4704
+Mismatches: 0
+Max abs diff: 0
+TEST PASSED -- HLS INT8 output matches Python int8 reference exactly
+```
+
+**C-synthesis, re-run:**
+
+| Metric | Before (per-pixel `fdiv`) | After (reciprocal-multiply) | Change | vs. float32 `conv_c1_systolic` |
+|---|---|---|---|---|
+| Latency (cycles) | 280,223 | **223,780** | **−20.1%** | float32 = 144,591 (int8 still +54.8% worse, down from +93.8%) |
+| BRAM | 5 (1%) | 5 (1%) | unchanged | still −72% vs float32 |
+| DSP | 13 (5%) | 13 (5%) | unchanged | still −7% vs float32 |
+| FF | 9,989 (9%) | 9,950 (9%) | −0.4% | still ~−66% vs float32 |
+| LUT | 16,519 (31%) | 16,461 (30%) | −0.4% | still ~−16% vs float32 |
+| Timing (10ns/100MHz target) | met (0.00ns slack) | **met (0.00ns slack)** | unchanged | float32 violates (−2.36ns) |
+| Estimated Fmax | 136.99 MHz | 136.99 MHz | unchanged | float32 = 104.80 MHz |
+
+**Latency improved meaningfully (−20%) without losing timing closure or any of the resource savings** — confirms the `fdiv` was a real cost and the fix is safe. It did **not**, however, close the full gap to float32's 144,591 cycles: the output-channel loop (`VITIS_LOOP_109_22`, trip count 6) is *still* not pipelined/flattened into the MAC reduction the way float32's equivalent loop is — its per-channel iteration latency dropped from 53→41 cycles (the `fdiv`'s contribution to the critical path is gone), but something else in the dequantize→ReLU→requantize→round→saturate chain still blocks flattening. Not chased further this pass — the concrete ask (does latency improve, is exactness/timing/resources preserved) is answered; diagnosing the remaining flattening blocker is a follow-up, not part of this change.
+
+### DSP investigation — what the 13 DSPs actually are
+
+Checked the Bind Op Report (both before and after the reciprocal-multiply change — the breakdown is identical either way) to answer directly: **only 8 of the 13 DSPs (62%) are the genuine int8 MAC array; the remaining 5 (38%) are still floating-point**, which is exactly why the DSP drop (14→13, −7%) was so much smaller than FF/BRAM's (−65%/−72%) despite the MAC math itself now being pure integer.
+
+| DSPs | Source | Detail |
+|---|---|---|
+| 8 | `conv_c1_int8_Pipeline_VITIS_LOOP_114_24` (the PE_COUNT=8 MAC array) | 8× `mac_muladd_8s_8s_32s_32_4_1`, one int8×int8→int32 MAC unit per PE lane, 1 DSP each — genuinely integer |
+| 3 | One shared `fmul_32ns_32ns_32_4_max_dsp_1` instance | Time-multiplexed across **three** separate float32 multiplies: `combined_scale = x_scale*w_scale`, `dequant = acc*combined_scale`, and (after the reciprocal-multiply change) `requant = dequant*inv_out_scale` — all three share one physical 3-DSP multiplier since they never execute concurrently |
+| 2 | One `fadd_32ns_32ns_32_5_full_dsp_1` instance | The round-half-away-from-zero step's `requant + 0.5f` / `requant - 0.5f` |
+| 0 | `fdiv_32ns_32ns_32_16_no_dsp_1` (`inv_out_scale = 1.0f/out_scale`) | Divider is LUT/fabric-only (no DSP), 15-cycle latency, but only instantiated/used **once** per call now, not once per pixel |
+| **13** | **Total** | matches the reported synthesis number exactly |
+
+So the answer: it's genuinely **not** the int8 MACs holding DSP usage up — those only need 8. The other 5 DSPs are the float32 requantization chain (the `fmul` for dequantize/rescale, the `fadd` for rounding) that this design still keeps as IEEE754 float rather than fixed-point/integer arithmetic. A fully-integer rescale (e.g. multiplying by a fixed-point approximation of `combined_scale/out_scale` and shifting, instead of a real `float` multiply) would plausibly get DSP down to just the 8 MAC-array DSPs — a ~43% drop from float32's 14, matching the kind of reduction the FF/BRAM numbers already show. **Not attempted this pass** — replacing the float rescale with a fixed-point one is a real architectural change (a shift-based or `ap_fixed`-based rescale instead of `float`), not a drop-in fix like the reciprocal-multiply was, and changes the rounding behavior enough that the Python reference and exact-match property would need to be re-derived around whatever fixed-point rescale scheme is chosen.
+
+### Follow-up — genuine fixed-point requantization (`conv_c1_int8_fixedpoint.cpp`, new)
+
+Implements the fixed-point rescale flagged as the next lever above: the requantization step (int32 accumulator → int8 output) is now a real **int64 multiply + rounding right-shift**, with zero floating-point operations anywhere in the per-pixel path — not `float`, not `fmul`/`fdiv`/`fadd`, nothing. Follows the same normalized-significand "quantization multiplier" technique TFLite/gemmlowp use (`tensorflow/lite/kernels/internal/quantization_util.cc`'s `QuantizeMultiplier()`), decomposing the real-valued ratio `combined_scale/out_scale` OFFLINE, once, in Python, into a Q31 fixed-point mantissa `M` and a shift `S` such that `(acc * M) >> S` (rounded) approximates `acc * (combined_scale/out_scale)`. `conv_c1_int8_fixedpoint.cpp`'s runtime interface carries only `M` (`ap_int<32>`) and `S` (`ap_int<8>`) — no float scale parameters at all, matching how real int8 accelerators actually work (the multiplier/shift are derived at model-conversion time, never recomputed by the chip).
+
+**Files added (again all new — `conv_c1_int8.cpp` from the previous stage stays untouched as its own reference point, same convention throughout):**
+- `hls/conv_c1/src/conv_c1_int8_fixedpoint.h`, `hls/conv_c1/src/conv_c1_int8_fixedpoint.cpp`
+- `hls/conv_c1/tb/conv_c1_int8_fixedpoint_tb.cpp`, `hls/conv_c1/tb/generate_test_data_int8_fixedpoint.py`, `hls/conv_c1/tb/conv_c1_int8_fixedpoint_test_data.h`
+- `hls/conv_c1/run_hls_int8_fixedpoint_pynqz2.tcl` — new solution, `conv_c1_int8_fixedpoint_proj`, same PYNQ-Z2 part
+
+**`quantize_multiplier(real_multiplier)`** (in the generator script): `math.frexp(real_multiplier)` decomposes it into `significand * 2**exponent` with `significand ∈ [0.5, 1.0)`; `M = round(significand * 2**31)` (renormalized if rounding pushes it to exactly `2**31`) is a Q31 fixed-point mantissa that **always fits comfortably inside signed int32** (`0 < M < 2**31`, never close to overflow); `S = 31 - exponent` folds both the Q31 descale and the significand's own exponent into one combined shift, applied over a 64-bit intermediate. (This combines gemmlowp's own two split steps — a fixed 31-bit "doubling high mul" plus a separate variable "rounding divide by power-of-two" — into one wider shift; gemmlowp splits them for ARM NEON SIMD performance reasons, not because it's numerically required.) For this layer's real data: **M = 1,947,178,031, S = 40** — M sits comfortably below `2**31 - 1 = 2,147,483,647`, nowhere near overflow, exactly as intended.
+
+**Recovering the reference accumulator, verified not assumed**: `conv2d_int()` computes the raw int32 accumulator internally but only returns the dequantized float (by its own design — see its docstring). The generator recovers it via the *exact inverse* of `conv2d_int()`'s own `acc.astype(np.float32) * combined_scale` step, then **checks** the round-trip is lossless before trusting it as the fixed-point reference's foundation:
+```
+Accumulator recovery verified exact. acc range: [-80059, 71713]
+```
+(an `assert` in the script, not a comment — it would have failed loudly rather than silently producing a wrong reference).
+
+**Bit-exactness was checked, not assumed — again.** The reciprocal-multiply version's rounding was already known to disagree with true division on this data (documented above: 530/4704 elements at the float level, 0/4704 after rounding). The fixed-point version's rounding rule (`(acc*M + 2^(S-1)) >> S`, round-half-up on a non-negative product) is a *third*, independently-derived arithmetic path — nothing was assumed equivalent to either earlier version. The Python reference was regenerated from scratch with this exact integer arithmetic (`quantize_multiplier()` + `requantize_fixed()` in `generate_test_data_int8_fixedpoint.py`), and only then was the identical logic ported to `conv_c1_int8_fixedpoint.cpp`.
+
+**C-simulation: exact match, confirmed independently of the previous two stages.**
+```
+Total output elements: 4704
+Mismatches: 0
+Max abs diff: 0
+TEST PASSED -- HLS fixed-point INT8 output matches Python fixed-point reference exactly
+```
+
+**C-synthesis: succeeded. No floating-point core is generated at all** — `vitis_hls`'s RTL generation log shows exactly one arithmetic core (`mul_31ns_32s_63_2_1`, a plain 31×32-bit signed integer multiplier) plus the usual muxes; no `fmul`/`fadd`/`fdiv`/`sitofp`, confirming the design is genuinely, entirely integer now.
+
+### Full three-way comparison: float32 → int8 (reciprocal-multiply) → int8 (fixed-point)
+
+| Metric | float32 (`conv_c1_systolic`) | int8, reciprocal-multiply (`conv_c1_int8`) | int8, **fixed-point** (`conv_c1_int8_fixedpoint`) |
+|---|---|---|---|
+| BRAM | 18 (6%) | 5 (1%) | **5 (1%)** |
+| DSP | 14 (6%) | 13 (5%) | **11 (5%)** |
+| FF | 28,886 (27%) | 9,950 (9%) | **9,889 (9%)** |
+| LUT | 19,572 (36%) | 16,461 (30%) | **16,124 (30%)** |
+| Latency (cycles) | 144,591 | 223,780 | **124,991** |
+| Timing (10ns/100MHz target) | Slack **−2.36ns** (violated) | Slack 0.00ns (met) | Slack **0.00ns** (met) |
+| Estimated Fmax | 104.80 MHz | 136.99 MHz | **136.99 MHz** |
+
+**The fixed-point version beats float32 `conv_c1_systolic` on every single metric** — the first INT8 variant of C1 to do so:
+- BRAM −72%, DSP −21%, FF −66%, LUT −18%, **and latency −13.6%** (124,991 vs 144,591 cycles) — the earlier reciprocal-multiply version was still +54.8% *worse* than float32 on latency despite its resource wins; removing the last floating-point ops from the per-pixel path doesn't just save area, it recovers (and then some) the latency float32 held.
+- Versus the reciprocal-multiply stage specifically: latency dropped a further 44.1% (223,780→124,991), and DSP dropped another 2 (13→11) — see the breakdown below for exactly where those 2 DSPs went.
+- Timing still closes cleanly (0.00ns slack, same 136.99MHz Fmax as the reciprocal-multiply stage) — removing the float chain didn't cost anything on the timing side either.
+
+**DSP breakdown (Bind Op Report) — now genuinely almost all MAC array:**
+
+| DSPs | Source |
+|---|---|
+| 8 | The PE_COUNT=8 MAC array (`mac_muladd_8s_8s_32s_32_4_1` ×8, unchanged from both earlier INT8 stages) |
+| 3 | `mul_31ns_32s_63_2_1` — the **one** integer multiply left in the whole design: `acc_relu (32-bit) × requant_mult (32-bit) → 64-bit` for the fixed-point rescale |
+| 0 | Every add/sub/shift (bias add, ReLU compare, the rounding `+half`, the `>>` itself) — all fabric-only, no DSP |
+| **11** | **Total** — down from the reciprocal-multiply version's 13 (8 MAC + 3 shared `fmul` + 2 `fadd`) |
+
+This directly closes the loop on the earlier open question ("would a fully-integer rescale get DSP down to just the 8 MAC-array DSPs?"): **almost, not quite** — 8 of 11 (73%) is the MAC array, but the fixed-point rescale's own 32×32→64 integer multiply still needs 3 DSPs of its own (a wide multiply is a wide multiply, whether its operands are meant as floats or fixed-point integers — DSP48 slices are general MAC primitives, not float-specific hardware). What actually disappeared going from 13→11 is the **`fadd`** (2 DSP, the float rounding step's `+0.5f`/`-0.5f`) — the fixed-point version's rounding (`+half` before the shift) is a plain integer add, free on fabric, with no dedicated adder core needed at all. The remaining 3-DSP multiplier is the practical floor for this design unless the rescale multiply itself were narrowed (e.g. a smaller `M` with fewer significant bits) or replaced with shift-and-add — not attempted here, as `M`'s full 31-bit precision is what makes the fixed-point rescale numerically match its Python reference exactly in the first place.
+
+**Next step**: `conv_c1_int8_fixedpoint.cpp` is the most hardware-realistic and best-performing C1 variant produced so far across all three axes (resources, latency, timing) — a reasonable candidate to standardize on when this pattern is extended to C3, rather than starting C3 from the float-requantize version.
+
+
+
+## S2 Pooling — INT8 Quantization (new, PYNQ-Z2)
+
+Extends the INT8 quantization work to S2 max pooling, per the project guide's INT8-conversion requirement. Unlike every one of conv_c1's INT8 stages, MaxPool needs **no scale factor and no requantization at all**: every value inside a 2×2 pooling window comes from the same activation tensor and therefore shares the exact same (positive) scale factor, so comparing raw int8 values directly gives exactly the same ordering — and so the same max — as comparing the real dequantized values would (max commutes with any positive affine rescale). This makes `pool_s2_int8` a much smaller, purely-structural change than `conv_c1_int8*`: same max-pooling logic, same `ARRAY_PARTITION` fix, `ap_int<8>` in place of `float`, nothing else.
+
+**Files added (float32 `pool_s2.cpp`/`.h` stay untouched, same convention as every stage above):**
+- `hls/pool/src/pool_s2_int8.h`, `hls/pool/src/pool_s2_int8.cpp`
+- `hls/pool/tb/pool_s2_int8_tb.cpp`, `hls/pool/tb/generate_test_data_int8.py`, `hls/pool/tb/pool_s2_int8_test_data.h`
+- `hls/pool/run_hls_int8_pynqz2.tcl` — new solution, `pool_s2_int8_proj`, same PYNQ-Z2 part (`xc7z020clg400-1`) as C1's INT8 work
+
+**Test data**: rather than arbitrary hand-picked values, the input is a *real* int8 C1 activation map, produced by literally running C1's own proven int8 pipeline (`generate_test_data_int8.py` here re-derives it: real `Models/lenet5_relu.keras` weights, real MNIST test[0] image, `quantize_int_real()`/`quantize_activation()`, the verified accumulator recovery, ReLU on the accumulator, and `conv_c1_int8_fixedpoint`'s own `quantize_multiplier()`/`requantize_fixed()` fixed-point requantization) — so `pool_s2_int8` is tested on genuinely realistic quantized activations, not synthetic data. The reference output is simply `np.max()` over int8 values directly (no multiplier, no shift — see above).
+
+**C-simulation: exact match.**
+```
+Total output elements: 1176
+Mismatches: 0
+Max abs diff: 0
+TEST PASSED -- HLS INT8 pool_s2 output matches Python int8 reference exactly
+```
+
+**C-synthesis: succeeded**, all loop constraints satisfied, auto-pipelined at II=1 with no explicit `PIPELINE` pragma needed (same as the float32 version).
+
+### Utilization — float32 (`pool_s2`) vs int8 (`pool_s2_int8`)
+
+| Metric | float32 (`pool_s2`, per this doc's existing S2 log) | int8 (`pool_s2_int8`, PYNQ-Z2) | Change |
+|---|---|---|---|
+| Latency (cycles) | 1,186 | 1,181 | −0.4% (essentially unchanged) |
+| II | 1 | 1 | unchanged |
+| DSP | 0 | 0 | unchanged |
+| FF | 576 | **158** | **−72.6%** |
+| LUT | 589 | **370** | **−37.2%** |
+| Timing / Fmax | not recorded in the earlier float32 run | Slack **+0.21ns** (met), Fmax **140.95MHz** | int8 confirmed meets timing; no float32 baseline was logged for this to compare against |
+
+(Float32 numbers are the ones already on record above under "S2 Pooling — HLS Optimization Log (final, corrected)" — that run didn't log an Fmax/timing figure, so this table reports "not recorded" honestly rather than inventing one; every other column there was a real synthesis result, not an estimate.)
+
+**Findings — matches the "should be simpler" expectation exactly:**
+
+1. **DSP stays at 0 in both.** Confirms the existing doc's own note above ("DSP=0 because pure comparisons need no MAC hardware") holds regardless of datatype — max-pooling was never MAC-shaped, so there was never any DSP to remove.
+2. **FF drops sharply (−73%) and LUT drops substantially (−37%)** — both entirely from the comparator itself, not from any structural change (the loop nest, the `ARRAY_PARTITION` fix, and the pipelining are byte-for-byte the same as float32). A float32 `>` comparison needs sign/exponent/mantissa-aware compare logic (and the registers to hold 32-bit operands through the pipeline); an `ap_int<8>` comparison is a trivial 8-bit magnitude compare with 4x narrower registers. This is the cleanest, least-confounded resource comparison of any layer converted so far — literally nothing but the datatype changed.
+3. **Latency is essentially identical (1,181 vs 1,186 cycles, both II=1)** — pooling's pipeline depth is governed by the loop structure and the `ARRAY_PARTITION` fix, not by how wide the compare is; both datatypes were already fully pipelined at II=1, so there was no float-specific latency cost to remove in the first place (unlike C1, where the float32 requantization chain's multi-cycle `fmul`/`fadd`/`fdiv` cores were the actual latency cost — pooling never had an equivalent).
+
+**Next step**: `pool_s2_int8` is done and validated. The guide's remaining named layers (C3, C5, F6, output dense) still need their own INT8 conversions; C3 in particular will need conv_c1_int8_fixedpoint's full multiplier+shift requantization pattern (it's a real MAC layer, not a comparison-only one like S2/S4), while S4 pooling can very likely reuse `pool_s2_int8.cpp`'s pattern directly, the same way the float32 S4 IP already reused S2's `ARRAY_PARTITION` fix with zero rework.
