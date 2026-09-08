@@ -544,3 +544,50 @@ TEST PASSED -- HLS INT8 pool_s2 output matches Python int8 reference exactly
 3. **Latency is essentially identical (1,181 vs 1,186 cycles, both II=1)** — pooling's pipeline depth is governed by the loop structure and the `ARRAY_PARTITION` fix, not by how wide the compare is; both datatypes were already fully pipelined at II=1, so there was no float-specific latency cost to remove in the first place (unlike C1, where the float32 requantization chain's multi-cycle `fmul`/`fadd`/`fdiv` cores were the actual latency cost — pooling never had an equivalent).
 
 **Next step**: `pool_s2_int8` is done and validated. The guide's remaining named layers (C3, C5, F6, output dense) still need their own INT8 conversions; C3 in particular will need conv_c1_int8_fixedpoint's full multiplier+shift requantization pattern (it's a real MAC layer, not a comparison-only one like S2/S4), while S4 pooling can very likely reuse `pool_s2_int8.cpp`'s pattern directly, the same way the float32 S4 IP already reused S2's `ARRAY_PARTITION` fix with zero rework.
+
+
+
+## S4 Pooling — INT8 Quantization (new, PYNQ-Z2)
+
+Extends INT8 pooling to S4, following `pool_s2_int8`'s exact pattern (predicted above and confirmed here) — same max-pooling logic and `ARRAY_PARTITION cyclic factor=2` fix, resized for S4's actual dimensions (C3's 10×10×16 output → 5×5×16), `ap_int<8>` throughout, no rescaling needed for the same reason S2 needed none. Also mirrors the float32 `pool_s4.cpp`'s one small addition over `pool_s2.cpp`: an explicit `#pragma HLS PIPELINE II=1` on the inner channel loop, kept since the float32 version was **built correctly from the start** with it (no baseline-then-fix cycle — S4 reused S2's proven fix directly) — same approach applied here, no baseline int8 build attempted first either.
+
+**Files added (float32 `pool_s4.cpp`/`.h` stay untouched):**
+- `hls/pool_s4/src/pool_s4_int8.h`, `hls/pool_s4/src/pool_s4_int8.cpp`
+- `hls/pool_s4/tb/pool_s4_int8_tb.cpp`, `hls/pool_s4/tb/generate_test_data_int8.py`, `hls/pool_s4/tb/pool_s4_int8_test_data.h`
+- `hls/pool_s4/run_hls_int8_pynqz2.tcl` — new solution, `pool_s4_int8_proj`, same PYNQ-Z2 part
+
+**Test data — chaining further than S2 needed to:** S4 sits after *both* C1 and C3, and no HLS C3 IP exists yet (only C1 has been converted to INT8 hardware so far), so producing a real (non-synthetic) 10×10×16 input meant running the full int8 pipeline in **Python**, chaining four stages in `generate_test_data_int8.py`:
+1. C1 conv (int8×int8→int32 MAC, ReLU on the accumulator, fixed-point requantize — same steps as `conv_c1_int8_fixedpoint`'s own generator) → real 28×28×6 int8 activations.
+2. S2 max pool (int8, no rescale) → 14×14×6. Its output shares C1's exact `out_scale` untouched, since pooling never changes the scale factor.
+3. C3 conv (`padding="valid"`, C1's `out_scale` as C3's *input* scale since S2 didn't change it, C3's own weights quantized fresh, same MAC → verified-accumulator-recovery → ReLU → fixed-point-requantize pattern as C1) → real 10×10×16 int8 activations. This is pure-Python int8 arithmetic reusing the proven pattern — no synthesizable C3 kernel needed for this purpose, exactly the "simpler proxy" question resolved in favor of doing the real chain, since the Python-only arithmetic was cheap to build correctly (verified exact accumulator recovery at C3 too, same `assert` pattern as every prior stage).
+4. That real C3 output is what `pool_s4_int8` is actually tested against — genuinely representative data, not synthetic.
+
+**C-simulation: exact match.**
+```
+Total output elements: 400
+Mismatches: 0
+Max abs diff: 0
+TEST PASSED -- HLS INT8 pool_s4 output matches Python int8 reference exactly
+```
+
+**C-synthesis: succeeded on the first attempt** (as expected — no baseline-then-fix cycle needed, same as float32 S4), all loop constraints satisfied.
+
+### Utilization — float32 (`pool_s4`) vs int8 (`pool_s4_int8`)
+
+| Metric | float32 (`pool_s4`, "built correctly from start") | int8 (`pool_s4_int8`, PYNQ-Z2) | Change |
+|---|---|---|---|
+| Latency (cycles) | 409 (411 total) | 406 (407 total) | −0.7% (essentially unchanged) |
+| II | 1 | 1 | unchanged |
+| DSP | 0 | 0 | unchanged |
+| FF | 565 | **147** | **−74.0%** |
+| LUT | 545 | **326** | **−40.2%** |
+| Fmax | 140.71 MHz | **142.57 MHz** | +1.3% |
+| Timing | clears 100MHz target | Slack **+0.29ns** (met) | both close timing |
+
+**Findings — same story as S2, confirmed at a second (differently-shaped, differently-sourced) layer:**
+
+1. **DSP stays at 0 in both**, latency is essentially unchanged (409→406 cycles, both II=1) — pooling's cost structure is set by the loop/partition structure, not the datatype, exactly as S2 already showed.
+2. **FF drops even further proportionally than S2's did (−74% vs −73%), LUT similarly (−40% vs −37%)** — consistent with the same underlying cause (a trivial 8-bit magnitude compare vs. a float32 sign/exponent/mantissa-aware compare, at 4x narrower registers), just at S4's own scale (16 channels vs S2's 6, smaller spatial extent).
+3. **Confirms the reusability prediction from S2's own write-up** ("S4 pooling can very likely reuse `pool_s2_int8.cpp`'s pattern directly, the same way the float32 S4 IP already reused S2's fix with zero rework") — it did, with the same resource-savings profile showing up again almost exactly.
+
+**Next step**: both pooling layers are now done in INT8. C3 (a real MAC layer) is the next natural target and is the only remaining piece needed before S4's own Python-side test-data chain could be replaced with a genuine HLS-verified C3 IP output; C5, F6, and the output dense layer remain unconverted.
