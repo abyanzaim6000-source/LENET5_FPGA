@@ -617,3 +617,107 @@ network:
 
 Both are legitimate, clearly-understood directions for further work, not open questions
 about whether the current design is correct or complete.
+
+---
+
+## Part 8: From Design to Real Hardware — Generating the Actual Bitstream
+
+Everything described up to this point — Vitis HLS's synthesis, the resource percentages,
+the timing estimates — are the *tool's own predictions* of what a design will need and how
+fast it will run, calculated before any real physical circuit has been laid out. The final,
+genuinely conclusive step is asking Vivado to actually perform **place-and-route**: taking
+the complete design and working out exactly which physical LUTs, flip-flops, and wires on
+the real chip each part of the design will occupy, and exactly how long signals will
+actually take to travel between them. The end product of this process is a **bitstream** —
+a file that, if loaded onto a real board, configures the FPGA's physical hardware to
+literally become the designed circuit. This is the only step that produces genuinely final,
+ground-truth numbers rather than estimates.
+
+### A real hardware constraint encountered along the way
+
+Partway through this process, the build appeared to simply stop making progress for an
+extended period — investigated properly rather than assumed to be a normal delay, by
+directly checking whether the relevant background process was still doing real work (its
+own measure of computation time was checked twice, several seconds apart, and had not
+moved at all in that window — a reliable sign of a genuine stall, not just a slow but
+active calculation).
+
+**The cause, once diagnosed, was a real resource limitation of the development machine
+itself, not a mistake in the design**: the machine performing this build had a relatively
+modest 7.7GB of memory available, and had been instructed to run four separate synthesis
+jobs *simultaneously* to save time — a completely reasonable choice for a machine with more
+memory, but one that caused all four jobs to compete for the same limited memory pool at
+once, most likely leading to the system thrashing (spending most of its effort swapping
+data in and out of memory rather than doing useful computation) rather than a true logical
+hang.
+
+**The fix**: the stalled attempt was stopped, and the exact same build was relaunched
+running only **one** job at a time instead of four. This trades total wall-clock time
+(each piece of work now happens one after another instead of overlapping) for a much
+smaller memory footprint at any given moment — and this time, the same synthesis step that
+had previously stalled for over three and a half hours with zero progress completed
+successfully in about 22 minutes.
+
+This is worth recording honestly as a genuine finding of the project: **implementing a
+network of this complete size is not just a matter of correct code, but also requires
+adequate development-machine resources** — a real, practical constraint of doing FPGA work
+on modest hardware, separate from any question of whether the design itself was correct.
+
+### The result: a complete, valid, working bitstream
+
+With the corrected, single-job approach, the full flow — logic synthesis, followed by
+placement, routing, and final bitstream generation — completed cleanly, with **zero
+design-rule-check errors** at every stage. The final bitstream file
+(`lenet5_system_wrapper.bit`, about 3.9 megabytes) was confirmed to exist and be valid.
+
+**Final, real, place-and-routed timing** (not an estimate — this is what the actual
+physical circuit, as laid out on the real chip, is capable of):
+
+| Timing Metric | Result | Meaning |
+|---|---|---|
+| Worst setup slack (WNS) | +3.659 ns | Positive means the design meets its clock speed target with margin to spare |
+| Worst hold slack (WHS) | +0.008 ns | Positive means it passes — but only just, with almost no safety margin |
+| Failing timing paths | 0 | Every single timing requirement in the whole design is satisfied |
+
+The worst setup slack being comfortably positive confirms the design genuinely can run at
+its intended clock speed. The hold slack passing by only eight-thousandths of a nanosecond
+is worth being upfront about: it passed, but with essentially no cushion — a legitimate,
+documented characteristic of this specific implementation, worth re-checking if the design
+is ever rebuilt with different tool settings or a different random starting layout, since a
+different attempt could plausibly land on the wrong side of zero even though the underlying
+design has not changed at all.
+
+**Final, real, place-and-routed resource usage** (the actual physical chip area consumed,
+measured after real placement — not the earlier per-layer HLS estimates):
+
+| Resource | Used | Chip's Total Capacity | Percentage |
+|---|---|---|---|
+| General logic (LUT) | 29,403 | 53,200 | 55.3% |
+| Memory bits (FF) | 41,096 | 106,400 | 38.6% |
+| Multiply-hardware (DSP) | 24 | 220 | 10.9% |
+| On-chip memory (BRAM) | 119.5 | 140 | 85.4% |
+
+**One detail worth explaining, since it might look surprising at first**: the real,
+final LUT usage (55.3%) came in noticeably *lower* than the earlier individual-IP HLS
+estimate (71%). This is expected, not an inconsistency to be concerned about — Vivado's
+whole-system placement step is able to find and eliminate redundant logic *across* the
+boundaries between different layers' hardware in a way that HLS, working on the seven
+layers somewhat independently, could not see or take advantage of. A real, final,
+whole-system number coming in more efficient than the sum of its independently-estimated
+parts is a normal and genuinely reassuring outcome.
+
+### What this represents, completed
+
+This is the conclusive result of the project's entire hardware-implementation effort: a
+**real, physically valid, timing-verified FPGA configuration file**, generated through the
+industry-standard tool flow (Vitis HLS for the individual layer designs, Vivado for full
+system integration and physical implementation), for a complete seven-layer LeNet-5 neural
+network — proven correct against real image data and real trained weights earlier in this
+document, and now proven to be a physically realizable, correctly-timed circuit on the
+actual target chip (Xilinx Zynq-7020), not merely a design that looked reasonable on paper
+or in simulation.
+
+The only remaining step this project has not attempted is physically loading this
+bitstream onto a real ZedBoard and confirming it correctly classifies live camera or
+pre-loaded image data on actual hardware — which requires physical board access, separate
+from anything achievable through software tools alone.
