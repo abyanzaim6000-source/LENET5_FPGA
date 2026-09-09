@@ -591,3 +591,82 @@ TEST PASSED -- HLS INT8 pool_s4 output matches Python int8 reference exactly
 3. **Confirms the reusability prediction from S2's own write-up** ("S4 pooling can very likely reuse `pool_s2_int8.cpp`'s pattern directly, the same way the float32 S4 IP already reused S2's fix with zero rework") — it did, with the same resource-savings profile showing up again almost exactly.
 
 **Next step**: both pooling layers are now done in INT8. C3 (a real MAC layer) is the next natural target and is the only remaining piece needed before S4's own Python-side test-data chain could be replaced with a genuine HLS-verified C3 IP output; C5, F6, and the output dense layer remain unconverted.
+
+
+
+## C3 Convolution — INT8 Quantization (new, PYNQ-Z2)
+
+Converts C3 to INT8, combining two already-proven pieces rather than starting from scratch: the **architecture** from `conv_c3_partialsum_lut.cpp` (the kept, superior stage of C3's own float32 optimization arc — PE_COUNT=6 partial-sum split with division-free LUT-based `(i,kr,kc)` decode, same flattened `mac_idx`/`(m,p)` loop nest that lets HLS auto-flatten the outer `o`/`r`/`c` loop into the inner pipeline), and the **requantization** from `conv_c1_int8_fixedpoint.cpp` (genuine fixed-point: int64 multiply by a Q31 mantissa + rounding right-shift, zero floating point anywhere in the per-pixel path).
+
+**Files added (all existing float32 C3 variants — `conv_c3.cpp`, `conv_c3_partialsum.cpp`, `conv_c3_partialsum_roundrobin.cpp`, `conv_c3_partialsum_lut.cpp` — stay untouched):**
+- `hls/conv_c3/src/conv_c3_int8_fixedpoint.h`, `hls/conv_c3/src/conv_c3_int8_fixedpoint.cpp`
+- `hls/conv_c3/tb/conv_c3_int8_fixedpoint_tb.cpp`, `hls/conv_c3/tb/generate_test_data_int8_fixedpoint.py`, `hls/conv_c3/tb/conv_c3_int8_fixedpoint_test_data.h`
+- `hls/conv_c3/run_hls_int8_fixedpoint_pynqz2.tcl` — new solution, `conv_c3_int8_fixedpoint_proj`, PYNQ-Z2 part (`xc7z020clg400-1`)
+
+### Python reference built and verified FIRST, independently of C1's
+
+Per the same rigor as every prior INT8 stage: the Python fixed-point reference was built and checked before any C++ was written. C3 sits after both C1 and S2, so producing a real (non-synthetic) 14×14×6 input meant re-running C1's own int8 pipeline first (duplicated fresh in this script, not imported — see the script's own docstring) purely to get a real activation map to pool and convolve over. But **C3's own quantization is derived and verified completely independently**, not reused from C1:
+
+- C3's weights quantized fresh via `quantize_int_real()`; C3's *input* scale is C1's `out_scale` carried through S2 unchanged (pooling doesn't rescale).
+- C3's raw int32 accumulator recovered from `conv2d_int()`'s float output via its exact inverse, and the round-trip **verified exact** — C3's own `assert`, independent of C1's:
+  ```
+  C3 accumulator recovery verified exact. acc range: [-78100, 53653]
+  ```
+- C3's own multiplier derived via `quantize_multiplier()`:
+  ```
+  C3 real_multiplier = combined_scale/out_scale = 0.002367062526883068
+  C3 quantize_multiplier -> M = 1301306386, S = 39
+  ```
+  (M comfortably inside signed int32, same as C1's M was — nowhere near `2**31 - 1`.)
+
+**A bug was caught at this stage, before it ever reached C++.** The first cross-check (comparing the fixed-point path against an independently-computed float path) showed 471/1600 mismatches — not the "small number at rounding boundaries" expected. Traced it: the cross-check itself double-applied `combined_scale` (multiplying the already-dequantized `relu_out` by `M/2^S ≈ combined_scale/out_scale` a *second* time, instead of just dividing by `out_scale` directly) — a bug in the verification script, not in `requantize_fixed()` or the actual reference. Fixed the cross-check to divide the already-dequantized value by `out_scale` directly (genuinely independent of `M`/`S`, analogous to the reciprocal-multiply-vs-division check done for C1) and re-ran:
+```
+Cross-check vs. independent float division (no M/S involved): 0/1600 int8 buckets differ; max abs diff in the pre-clip requantized value: 0.0
+```
+Exact agreement, confirmed **before** writing any HLS C++ — exactly the "confirm bit-exact match in Python before touching HLS" this stage asked for, and a concrete example of why that check matters even when the underlying technique is already proven.
+
+### C-simulation: exact match
+
+```
+Total output elements: 1600
+Mismatches: 0
+Max abs diff: 0
+TEST PASSED -- HLS fixed-point INT8 C3 output matches Python fixed-point reference exactly
+```
+
+### C-synthesis
+
+The known accumulator-latency floor from C3's own float32 log reproduces here too (expected, not a regression): `Loop Constraint Status: All loop constraints were NOT satisfied` — same mechanism documented in C3's float32 optimization log above (the MAC reduction's carried dependency caps II below the II=1 target). The int8 version's inner MAC pipeline (`VITIS_LOOP_61_5`, trip 25 = `MACS_PER_PE`) achieves **II=3**, an improvement over float32's **II=4** — a narrower int32 accumulator add resolves faster than a 32-bit float `fadd`'s multi-cycle latency, the same mechanism C1's stages already showed.
+
+### Utilization — float32 (`conv_c3_partialsum_lut`) vs int8 (`conv_c3_int8_fixedpoint`)
+
+| Metric | float32 (`conv_c3_partialsum_lut`, `xc7z020-clg484-1`) | int8, fixed-point (`conv_c3_int8_fixedpoint`, PYNQ-Z2) | Change |
+|---|---|---|---|
+| BRAM | 0 | 0 | unchanged |
+| DSP | 12 (5%) | **9 (4%)** | **−25.0%** |
+| FF | 3,013 (2%) | **1,523 (1%)** | **−49.4%** |
+| LUT | 6,250 (11%) | **4,919 (9%)** | **−21.3%** |
+| Latency (cycles) | 160,047 | **150,401** | **−6.0%** |
+| Inner-loop II (achieved/target) | 4/1 | **3/1** | improved, target still not met |
+| Timing (10ns/100MHz target) | Slack **−1.66ns** (violated) | Slack **0.00ns** (met) | int8 closes timing, float32 doesn't |
+| Estimated Fmax | 111.66 MHz | **136.99 MHz** | +22.7% |
+
+**C3 beats float32 on every single metric, same as C1's fixed-point stage did** — the pattern holds at a second, larger, more complex layer (PE_COUNT=6 vs C1's PE_COUNT=8, 16 output channels vs 6, an existing LUT-decode optimization already in play rather than a from-scratch baseline).
+
+**DSP breakdown (Bind Op Report) — confirms exactly where the 12→9 DSPs went:**
+
+| DSPs | float32 (`conv_c3_partialsum_lut`) | int8 (`conv_c3_int8_fixedpoint`) |
+|---|---|---|
+| PE array (PE_COUNT=6) | 12 (2 DSP/lane — float MAC's `fmul`+`fadd`) | **6** (1 DSP/lane — `mac_muladd_8s_8s_20s`, genuine int8×int8→int32) |
+| Rescale | 0 (float ReLU is a free same-cycle compare) | **3** (`mul_31ns_32s_63`, the one int64 fixed-point rescale multiply — same single core as C1's) |
+| **Total** | **12** | **9** |
+
+This is a cleaner accounting than C1's was: float32's 6 MAC lanes cost 2 DSP each (12 total) with *no* separate rescale cost (ReLU was free); int8's 6 MAC lanes cost 1 DSP each (6 total, halved) but add back 3 DSP for the one rescale multiply the float32 version never needed — netting a 25% reduction rather than a larger one, because narrowing the MAC itself (float→int8) saves proportionally more here than the fixed 3-DSP rescale multiply costs.
+
+**Findings, consistent with C1's own fixed-point stage:**
+
+1. **The fixed-point technique transfers directly to a more complex, already-optimized layer with zero surprises** — same architecture-plus-requantization composition, same exact-match discipline, same result shape (beats float32 everywhere).
+2. **Latency actually improved (−6.0%)** despite C3's accumulator-limited floor persisting in both versions — the narrower/faster int8 MAC chain (II=3 vs II=4) more than compensates for whatever overhead the rescale step adds, unlike C1's *first* INT8 stage (the float-division version), which was initially *slower* than float32 before the reciprocal-multiply and fixed-point fixes closed that gap. Going straight to the fixed-point version here (skipping the float-requantize baseline entirely, since it was already known to be inferior) avoided repeating that detour.
+3. **BRAM stays at 0 in both** — C3 was never BRAM-bound (no AXI/line-buffer machinery here, unlike C1's standalone-IP interface style; C3 is called as a sub-function, plain `ap_memory` arrays only).
+
+**Next step**: C1 and C3 (the two real MAC/conv layers) and both pooling layers (S2, S4) are now all done in INT8, all following the same proven pattern (fixed-point PE-array MAC + `quantize_multiplier()`-derived rescale for conv layers, plain int8 compare for pooling). C5, F6, and the output dense layer (softmax) remain — C5/F6 should extend the same conv-layer pattern (MAC + fixed-point requantize, no LUT-decode needed since dense layers don't have `(i,kr,kc)` coordinates to decode), while the output layer's softmax stage will need its own INT8-appropriate treatment (softmax doesn't requantize to int8 the same way ReLU layers do). With S4's real C3-sourced test data no longer needing a Python-only C3 stand-in, S4's testbench could optionally be regenerated against the real `conv_c3_int8_fixedpoint` HLS output instead — not required (the Python arithmetic is already proven identical), but available if end-to-end HLS-to-HLS chaining is ever wanted.
