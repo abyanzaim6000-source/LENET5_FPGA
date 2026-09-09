@@ -670,3 +670,150 @@ This is a cleaner accounting than C1's was: float32's 6 MAC lanes cost 2 DSP eac
 3. **BRAM stays at 0 in both** — C3 was never BRAM-bound (no AXI/line-buffer machinery here, unlike C1's standalone-IP interface style; C3 is called as a sub-function, plain `ap_memory` arrays only).
 
 **Next step**: C1 and C3 (the two real MAC/conv layers) and both pooling layers (S2, S4) are now all done in INT8, all following the same proven pattern (fixed-point PE-array MAC + `quantize_multiplier()`-derived rescale for conv layers, plain int8 compare for pooling). C5, F6, and the output dense layer (softmax) remain — C5/F6 should extend the same conv-layer pattern (MAC + fixed-point requantize, no LUT-decode needed since dense layers don't have `(i,kr,kc)` coordinates to decode), while the output layer's softmax stage will need its own INT8-appropriate treatment (softmax doesn't requantize to int8 the same way ReLU layers do). With S4's real C3-sourced test data no longer needing a Python-only C3 stand-in, S4's testbench could optionally be regenerated against the real `conv_c3_int8_fixedpoint` HLS output instead — not required (the Python arithmetic is already proven identical), but available if end-to-end HLS-to-HLS chaining is ever wanted.
+
+
+
+## C5 Dense — INT8 Quantization (new, PYNQ-Z2)
+
+Combines two already-proven pieces, same composition approach as C3: the **architecture** from `dense_c5_partialsum.cpp` (the kept PE_COUNT=4 partial-sum split — 400-term reduction across 4 independent accumulator chains, flattened `mac_idx`/`(m,p)` loop nest), and the **requantization** from `conv_c1_int8_fixedpoint.cpp`/`conv_c3_int8_fixedpoint.cpp` (genuine fixed-point: int64 multiply by a Q31 mantissa + rounding right-shift, zero floating point anywhere in the per-neuron path).
+
+**Files added (existing float32 variants — `dense_c5.cpp`, `dense_c5_partialsum.cpp` — stay untouched):**
+- `hls/dense_c5/src/dense_c5_int8_fixedpoint.h`, `hls/dense_c5/src/dense_c5_int8_fixedpoint.cpp`
+- `hls/dense_c5/tb/dense_c5_int8_fixedpoint_tb.cpp`, `hls/dense_c5/tb/generate_test_data_int8_fixedpoint.py`, `hls/dense_c5/tb/dense_c5_int8_fixedpoint_test_data.h`
+- `hls/dense_c5/run_hls_int8_fixedpoint_pynqz2.tcl` — new solution, `dense_c5_int8_fixedpoint_proj`, PYNQ-Z2 part (`xc7z020clg400-1`)
+
+### Python reference built and verified FIRST, chaining the real C1→S2→C3→S4 int8 pipeline
+
+Per the same rigor as every prior INT8 stage: the Python fixed-point reference was built and checked before any C++ was written. C5 sits after C1, S2, C3, and S4, so producing a real (non-synthetic) 400-element input meant re-running the full C1→S2→C3→S4 int8 pipeline first (duplicated fresh in this script, not imported — see the script's own docstring), then flattening S4's 5×5×16 output with NumPy's default C-order `.flatten()` (the same call `hls/lenet5_top/tb/generate_test_data.py` uses, matching Keras' `Flatten()` layer) into the 400-element vector `dense_c5_int8_fixedpoint` actually consumes. **C5's own quantization is derived and verified completely independently** of every earlier layer:
+
+- C5's weights quantized fresh via `quantize_int_real()`; C5's *input* scale is C3's `out_scale` carried through S4 and the flatten unchanged (neither pooling nor flattening rescales).
+- C5's raw int32 accumulator recovered from `dense_int()`'s float output via its exact inverse, and the round-trip **verified exact** — C5's own `assert`, independent of every earlier layer's:
+  ```
+  C5 accumulator recovery verified exact. acc range: [-95548, 58826]
+  ```
+- C5's own multiplier derived via `quantize_multiplier()`:
+  ```
+  C5 real_multiplier = combined_scale/out_scale = 0.0021589092456742068
+  C5 quantize_multiplier -> M = 1186872909, S = 39
+  ```
+  (M comfortably inside signed int32.)
+- Cross-check vs. an independently-computed float division (no `M`/`S` involved at all): **0/120 int8 buckets differ**, max abs diff in the pre-clip requantized value 0.0 — confirmed exact agreement before writing any HLS C++.
+
+### C-simulation: exact match
+
+```
+Total output elements: 120
+Mismatches: 0
+Max abs diff: 0
+TEST PASSED -- HLS fixed-point INT8 C5 output matches Python fixed-point reference exactly
+```
+
+### C-synthesis
+
+**A different bottleneck class than every earlier INT8 stage.** C1's and C3's `Loop Constraint Status: NOT satisfied` came from the accumulator's own recurrence (still true here too, in principle), but the HLS scheduler log for C5 instead reports the *actual* limiter directly:
+```
+WARNING: [HLS 200-885] The II Violation ...: Unable to schedule 'load' operation ('input_r_load_1') on
+array 'input_r' due to limited memory ports (II = 1). ... Pipelining result : Target II = 1, Final II = 2
+```
+Unlike the float32 version (accumulator-latency-limited at II=4 by the `fadd`'s 4-cycle latency — see this layer's own optimization log above), int8's integer add resolves in a single cycle, so the accumulator recurrence stops being the bottleneck; instead, the PE_COUNT=4-way unrolled reads of `input`/`weights` per iteration now saturate the plain `ap_memory` interface's 2 read ports first, capping II at 2 rather than 1. Still a clear win over float32's II=4 floor either way.
+
+### Utilization — float32 (`dense_c5_partialsum`) vs int8 (`dense_c5_int8_fixedpoint`)
+
+| Metric | float32 (`dense_c5_partialsum`, `xc7z020-clg484-1`) | int8, fixed-point (`dense_c5_int8_fixedpoint`, PYNQ-Z2) | Change |
+|---|---|---|---|
+| BRAM | 0 | 0 | unchanged |
+| DSP | 7 (3%) | 7 (3%) | unchanged |
+| FF | 1,863 (1%) | **740 (~0%)** | **−60.3%** |
+| LUT | 2,253 (4%) | **1,827 (3%)** | **−18.9%** |
+| Latency (cycles) | 48,031 | **25,801** | **−46.3%** |
+| Inner-loop II (achieved/target) | 4/1 | **2/1** | improved, target still not met |
+| Timing (10ns/100MHz target) | Slack **−1.66ns** (violated) | Slack **0.14ns** (met) | int8 closes timing, float32 doesn't |
+| Estimated Fmax | 111.66 MHz | **139.72 MHz** | +25.1% |
+
+**DSP breakdown (Bind/Instance report):**
+
+| DSPs | float32 (`dense_c5_partialsum`) | int8 (`dense_c5_int8_fixedpoint`) |
+|---|---|---|
+| PE array (PE_COUNT=4) | — (not broken out in the float32 report) | **4** (1 DSP/lane — `mac_muladd_8s_8s_22s`, genuine int8×int8→int32) |
+| Rescale | 0 (float ReLU is a free same-cycle compare) | **3** (`mul_31ns_32s_63`, the same single fixed-point rescale core as C1's/C3's) |
+| **Total** | **7** | **7** |
+
+DSP total lands exactly unchanged (7→7) — the first INT8 stage in this project where that happens: narrowing the 4 MAC lanes from float to int8 drops their cost to 1 DSP/lane (4 total), but that saving is exactly offset by the 3 DSP the one fixed-point rescale multiply adds (which the float32 version, with its free ReLU compare, never needed) — a coincidence of this layer's specific PE_COUNT/lane-cost combination, not a general rule.
+
+**Findings, consistent with C1's and C3's own fixed-point stages:**
+
+1. **The fixed-point technique transfers directly to a dense (fully-connected) layer with zero surprises** — same architecture-plus-requantization composition, same exact-match discipline, same result shape (beats or matches float32 on every metric, never worse).
+2. **The bottleneck mechanism itself changed, not just its severity** — this is the first INT8 stage where the II floor comes from memory ports rather than the accumulator's arithmetic latency, because int8 addition is fast enough that the recurrence is no longer the critical path. Confirms the layer's own float32 diagnosis (`fadd`'s 4-cycle latency) really was arithmetic-specific, not structural.
+3. **Latency drops nearly 2x (−46.3%)** — both because II improved (4→2) and because the fixed-point requantize is cheaper per neuron than float32's ReLU-then-nothing (no dequant/requant round-trip needed at all, the accumulator's sign check IS the ReLU).
+
+**Next step**: F6 is the next natural target — same PE_COUNT=4 architecture at F6's own dimensions (120→84), chaining C5's own real int8 output as F6's real input.
+
+
+
+## F6 Dense — INT8 Quantization (new, PYNQ-Z2)
+
+Identical composition to C5: the **architecture** from `dense_c5_int8_fixedpoint.cpp`'s own PE_COUNT=4 partial-sum split (itself `dense_c5_partialsum.cpp`'s proven pattern, applied directly at F6's dimensions — 120 inputs, 84 outputs — same reusable-IP principle the float32 `dense_f6.cpp` already used against `dense_c5_partialsum.cpp`), and the same fixed-point requantization as every INT8 stage above.
+
+**Files added (existing float32 variant — `dense_f6.cpp` — stays untouched):**
+- `hls/dense_f6/src/dense_f6_int8_fixedpoint.h`, `hls/dense_f6/src/dense_f6_int8_fixedpoint.cpp`
+- `hls/dense_f6/tb/dense_f6_int8_fixedpoint_tb.cpp`, `hls/dense_f6/tb/generate_test_data_int8_fixedpoint.py`, `hls/dense_f6/tb/dense_f6_int8_fixedpoint_test_data.h`
+- `hls/dense_f6/run_hls_int8_fixedpoint_pynqz2.tcl` — new solution, `dense_f6_int8_fixedpoint_proj`, PYNQ-Z2 part (`xc7z020clg400-1`)
+
+### Python reference built and verified FIRST, chaining the real C1→S2→C3→S4→C5 int8 pipeline
+
+Same rigor as every prior stage: F6's real 120-element input is C5's own real int8 output, produced by re-running the full C1→S2→C3→S4→flatten→C5 int8 pipeline fresh in this script (not imported — C5's own M/S are re-derived here too, independently of `dense_c5`'s own generator script). **F6's own quantization is derived and verified completely independently** of every earlier layer:
+
+- F6's weights quantized fresh via `quantize_int_real()`; F6's *input* scale is C5's own `out_scale`.
+- F6's raw int32 accumulator recovered from `dense_int()`'s float output via its exact inverse, and the round-trip **verified exact** — F6's own `assert`:
+  ```
+  F6 accumulator recovery verified exact. acc range: [-29327, 35373]
+  ```
+- F6's own multiplier derived via `quantize_multiplier()`:
+  ```
+  F6 real_multiplier = combined_scale/out_scale = 0.0035903089928803603
+  F6 quantize_multiplier -> M = 1973793242, S = 39
+  ```
+- Cross-check vs. an independently-computed float division: **0/84 int8 buckets differ**, max abs diff 0.0 — confirmed exact before writing any HLS C++.
+
+### C-simulation: exact match
+
+```
+Total output elements: 84
+Mismatches: 0
+TEST PASSED -- HLS fixed-point INT8 F6 output matches Python fixed-point reference exactly
+```
+
+### C-synthesis
+
+Same memory-port-limited mechanism as C5 (not the accumulator recurrence): `Unable to schedule 'load' operation ('input_r_load_1') ... due to limited memory ports`, `Final II = 2` against a target of 1 — confirms C5's diagnosis generalizes, independent of N_IN (120 here vs. C5's 400).
+
+### Utilization — float32 (`dense_f6`) vs int8 (`dense_f6_int8_fixedpoint`)
+
+| Metric | float32 (`dense_f6`, `xc7z020-clg484-1`) | int8, fixed-point (`dense_f6_int8_fixedpoint`, PYNQ-Z2) | Change |
+|---|---|---|---|
+| BRAM | 0 | 0 | unchanged |
+| DSP | 11 (5%) | 11 (5%) | unchanged |
+| FF | 1,673 (1%) | **887 (~0%)** | **−47.0%** |
+| LUT | 1,988 (3%) | **1,749 (3%)** | **−12.0%** |
+| Latency (cycles) | 10,113 | **6,469** | **−36.0%** |
+| Inner-loop II (achieved/target) | 4/1 | **2/1** | improved, target still not met |
+| Timing (10ns/100MHz target) | Slack **−1.66ns** (violated) | Slack **0.25ns** (met) | int8 closes timing, float32 doesn't |
+| Estimated Fmax | 111.66 MHz | **141.79 MHz** | +27.0% |
+
+**DSP breakdown (Bind/Instance report):**
+
+| DSPs | float32 (`dense_f6`) | int8 (`dense_f6_int8_fixedpoint`) |
+|---|---|---|
+| PE array (PE_COUNT=4) | — (not broken out in the float32 report) | **8** (2 DSP/lane) |
+| Rescale | 0 (float ReLU is a free same-cycle compare) | **3** (`mul_31ns_32s_63`, same rescale core) |
+| **Total** | **11** | **11** |
+
+DSP total again lands exactly unchanged (11→11) — same coincidence as C5, though the split differs (F6's PE array binds at 2 DSP/lane here vs. C5's 1 DSP/lane for the identical PE_COUNT=4 architecture; a scheduling/binding artifact of the different N_IN/MACS_PER_PE trip count, not a difference in the source code).
+
+**Findings, consistent with C5's own fixed-point stage:**
+
+1. **The fixed-point technique and the PE_COUNT=4 architecture both transfer unchanged from C5 to F6**, exactly the "only dimensions changed" reuse the float32 `dense_f6.cpp` already demonstrated against `dense_c5_partialsum.cpp` — now confirmed true for the INT8/fixed-point version too.
+2. **The memory-port-limited II=2 floor is independent of N_IN** (120 here vs. C5's 400) — same mechanism, same final II, consistent with C5's own finding that this is a port-count property of the `ap_memory` interface, not something that scales with problem size.
+3. **DSP staying exactly flat (11→11) at both C5 and F6, despite the two designs splitting those DSPs differently between the MAC array and the rescale multiply**, is the first time in this project's INT8 conversion that resource neutrality (rather than a clear reduction) is the headline DSP result — still a strict win overall given the simultaneous latency, FF, LUT, and timing improvements.
+
+**Next step**: C5 and F6 (both dense ReLU layers) are now done in INT8, joining C1, C3 (conv/MAC layers) and S2, S4 (pooling) — six of the network's seven layers. Only the output dense layer (softmax) remains; its softmax stage will need its own INT8-appropriate treatment (softmax doesn't requantize to int8 the same way ReLU layers do, per this project's own float32 optimization log for that layer above).
