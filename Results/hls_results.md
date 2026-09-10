@@ -816,4 +816,92 @@ DSP total again lands exactly unchanged (11→11) — same coincidence as C5, th
 2. **The memory-port-limited II=2 floor is independent of N_IN** (120 here vs. C5's 400) — same mechanism, same final II, consistent with C5's own finding that this is a port-count property of the `ap_memory` interface, not something that scales with problem size.
 3. **DSP staying exactly flat (11→11) at both C5 and F6, despite the two designs splitting those DSPs differently between the MAC array and the rescale multiply**, is the first time in this project's INT8 conversion that resource neutrality (rather than a clear reduction) is the headline DSP result — still a strict win overall given the simultaneous latency, FF, LUT, and timing improvements.
 
+
+
+## Output Dense (Softmax) — INT8 Quantization (new, PYNQ-Z2)
+
+Unlike every earlier INT8 layer (C1, C3, C5, F6), this is deliberately **not** a "`_fixedpoint`" design, and the reasoning is worth stating before the implementation: fixed-point rescaling exists in this project specifically to avoid floating-point cost on a *repeated, per-pixel* datapath that feeds another quantized layer — that's what justified paying for `quantize_multiplier()`'s Q31-mantissa-plus-shift machinery at every earlier stage. The Output layer's softmax is the network's **final** activation: its result is read as a probability distribution by a human or a downstream host, not fed forward into another int8 MAC, and it runs on only `N_OUT=10` values once per inference, not once per pixel. Paying fixed-point complexity for that would add hardware cost for no benefit. So this IP keeps the proven float32 `dense_output.cpp`'s own two-stage structure exactly, changing only Stage 1's datapath:
+
+- **Stage 1 (MAC accumulation)** — genuine int8×int8→int32 integer arithmetic, same `PE_COUNT=4` partial-sum architecture as `dense_c5_int8_fixedpoint.cpp`/`dense_f6_int8_fixedpoint.cpp`, into a local `ap_int<32> logits[N_OUT]` array. No activation, no requantization to int8 — this accumulator is never consumed by another quantized layer, so unlike every earlier layer there is nothing to rescale it *for*.
+- **Stage 2 (softmax)** — dequantizes Stage 1's accumulator to float via the same `combined_scale = x_scale*w_scale` every conv/dense layer already computes, then reuses `dense_output.cpp`'s own proven max-subtract/exp/sum/divide **unchanged**. This mirrors `src/integer_layers.py`'s own `dense_int(..., activation="softmax")`, which does exactly this: integer MAC, then float dequantize+softmax. `x_scale`/`w_scale` are passed in as plain float scalars, the same convention `conv_c1_int8.h` (the project's own precedent for an "int8 MAC + float finish" design, before `_fixedpoint` existed) already used.
+
+**Files added (existing float32 IP — `dense_output.cpp` — stays untouched):**
+- `hls/dense_output/src/dense_output_int8.h`, `hls/dense_output/src/dense_output_int8.cpp`
+- `hls/dense_output/tb/dense_output_int8_tb.cpp`, `hls/dense_output/tb/generate_test_data_int8.py`, `hls/dense_output/tb/dense_output_int8_test_data.h`
+- `hls/dense_output/run_hls_int8_pynqz2.tcl` — new solution, `dense_output_int8_proj`, PYNQ-Z2 part (`xc7z020clg400-1`)
+
+### Python reference built and verified FIRST, chaining the full real C1→S2→C3→S4→C5→F6 int8 pipeline
+
+Same rigor as every prior stage: the Output layer's real 84-element input is F6's own real int8 output, produced by re-running the full C1→S2→C3→S4→flatten→C5→F6 int8 pipeline fresh in this script (not imported — every earlier layer's own M/S is re-derived here too, independently of its own generator script). **The Output layer's own quantization is derived and verified completely independently** of every earlier layer:
+
+- Output's weights quantized fresh via `quantize_int_real()`; Output's *input* scale is F6's own `out_scale`.
+- Output's raw int32 accumulator (the pre-softmax logits) recovered from `dense_int()`'s float output via its exact inverse, and the round-trip **verified exact** — Output's own `assert`:
+  ```
+  Output accumulator recovery verified exact. acc (logits) range: [-60804, 65305]
+  ```
+- Unlike every earlier layer, there is **no `quantize_multiplier()` call here at all** — the reference re-dequantizes the verified accumulator with `combined_scale` directly (`acc_recovered.astype(float32) * combined_scale`, asserted equal to `dense_int()`'s own float output) and runs the exact same NumPy max-subtract/exp/sum/divide the network's own float32 reference uses:
+  ```
+  Output softmax reference: [4.04e-09, 7.13e-07, 2.39e-06, 7.28e-05, 5.21e-12, 3.07e-07, 9.44e-12, 9.9992e-01, 8.00e-08, 4.10e-08]
+  Sum: 0.99999994, predicted label = 7 (true label = 7)
+  ```
+
+### C-simulation: matches within tight float tolerance (not bit-exact — by design)
+
+Stage 1's int32 accumulator is genuine integer arithmetic and deterministic — any error there would show up as a large discrepancy, not a small one. Stage 2 is intentionally float, so (same standard this project's own `lenet5_top_tb.cpp` already uses for its softmax output, which matched its NumPy reference to 6.5e-11, not bit-for-bit) the testbench checks a tight numerical tolerance rather than exact equality:
+```
+output[7] = 0.999924  (expected 0.999924)
+Sum of outputs: 1
+Predicted label: 7 (true label: 7)
+Max abs diff vs. Python reference: 1.19209e-07
+TEST PASSED -- HLS INT8 Output softmax matches Python reference within tolerance
+```
+Max absolute difference across all 10 outputs is 1.19e-7 — single-precision float rounding noise from `std::exp()` vs. NumPy's `exp()`, not an arithmetic error — and the predicted class (7) matches the true MNIST label, exactly like the float32 baseline.
+
+### C-synthesis
+
+**Per-stage breakdown** (same structure as the float32 baseline's own table above):
+
+| Stage | Latency (cycles) | II (achieved/target) | Trip count | DSP | Notes |
+|---|---|---|---|---|---|
+| MAC accumulation | 520 (outer, not flattened) / inner pipeline 47 | **2 / 1** | 21×10 = 210 | 4 | Same PE_COUNT=4 architecture as C5/F6; memory-port-limited at II=2 like both (not accumulator-limited — int8 add is fast enough), same mechanism, unflattened outer loop this time (10 trips of the inner pipeline, vs. float32's fully-flattened single 210-iteration pipeline) |
+| Dequantize (int32→float ×10) | 23 | — | 10 | 0 | New stage, not present in float32 (its accumulator was already float) — cheap, not a per-pixel cost |
+| Find max logit | 22 | 2 / 1 | 9 | 0 | Identical cycle count and II to float32 — this stage's code and datapath are completely unchanged |
+| exp + sum | 70 | 5 / 1 | 10 | 9 | Identical cycle count and II to float32 (same `std::exp` code) — DSP differs (9 vs. float32's 7), a resource-binding effect of the new dequantize stage changing what gets shared, not a code change |
+| Normalize (divide) | 29 | 1 / 1 | 10 | 0 | Identical to float32 — unchanged code |
+
+**Loop Constraint Status: NOT satisfied** (MAC stage's II=2 floor, same as C5/F6) — expected, not a regression.
+
+### Utilization — float32 (`dense_output`) vs int8 (`dense_output_int8`)
+
+| Metric | float32 (`dense_output`, `xc7z020-clg484-1`) | int8 (`dense_output_int8`, PYNQ-Z2) | Change |
+|---|---|---|---|
+| BRAM | 0 | 0 | unchanged |
+| DSP | 14 (6%) | **16 (7%)** | **+14.3% (worse)** |
+| FF | 2,778 (2%) | **1,834 (1%)** | **−34.0%** |
+| LUT | 3,721 (6%) | **2,973 (5%)** | **−20.1%** |
+| Latency (cycles) | 999 | **678** | **−32.1%** |
+| Timing (10ns/100MHz target) | Slack **−1.66ns** (violated) | Slack **0.04ns** (met) | int8 closes timing, float32 doesn't (barely — smallest margin of any layer so far) |
+| Estimated Fmax | 111.66 MHz | **137.82 MHz** | +23.4% |
+
+**DSP breakdown (Instance report) — the one metric that got WORSE, and exactly why:**
+
+| DSPs | float32 (`dense_output`) | int8 (`dense_output_int8`) |
+|---|---|---|
+| MAC stage (PE_COUNT=4) | 5 | **4** |
+| Dequantize (new stage) | — (didn't exist) | **0** |
+| Find max | 0 | 0 |
+| exp + sum | 7 | **9** |
+| Normalize | 0 | 0 |
+| Shared instance (`faddfsub`/`fmul`, resource-shared across stages) | 2 | **3** |
+| **Total** | **14** | **16** |
+
+**Findings:**
+
+1. **This is the first INT8 layer in this project where total DSP goes up, not down or flat** — and the cause is fully accounted for: the MAC stage *does* shrink as expected (5→4, int8's narrower multiply), but that's a small saving here because `N_OUT=10` was already cheap for float32 to resource-share efficiently (5 DSP for 4 lanes, not the naive 8). The increase comes entirely from Stage 2 — the `exp`+`sum` stage costs 2 more DSP (7→9) purely from a resource-binding side effect of adding the new dequantize stage ahead of it (same `std::exp` source code, confirmed by find-max and normalize being byte-for-byte identical in cycle count to float32), plus the shared floating-point instance costing 1 more DSP (2→3). None of this is a design flaw — it's the honest cost of the design decision explained at the top: keeping Stage 2 in float (cheap in LUT/FF/latency terms, and correct) has a small DSP price at this layer's tiny N_OUT=10 scale, and it's worth paying since Stage 2 was never the resource bottleneck for either version.
+2. **Every other metric still improves, most by a wide margin**: FF −34.0%, LUT −20.1%, latency −32.1% (largely from Stage 1's MAC stage no longer needing full loop-flattening to beat float32's flattened-but-II=4 baseline), and timing flips from a −1.66ns violation to a (barely) met 0.04ns slack — the smallest positive margin of any INT8 conversion in this project so far, worth flagging if this layer is ever pushed further (e.g. more slack headroom might be wanted before board bring-up).
+3. **Stage 2's untouched stages (find max, normalize) reproduce float32's exact cycle counts and II**, confirming the two-stage architecture transplant was clean — the only real changes are Stage 1's datapath (float MAC → int8 MAC) and the one new dequantize stage Stage 2 needed to bridge them, exactly as designed.
+4. **The design choice to keep softmax in float, rather than inventing a fixed-point exp/normalize, is validated by these numbers**: the "cost" is 2 DSP at the whole design's smallest layer, in exchange for reusing proven, already-optimized float32 code unchanged for two of Stage 2's three sub-stages — a good trade for a stage that runs once per inference on 10 values, not once per pixel.
+
+**Next step**: all seven layers of the network (C1, C3 — conv/MAC; S2, S4 — pooling; C5, F6, Output — dense) now have INT8 implementations, each independently verified against its own from-scratch Python reference and chained through the real upstream int8 pipeline rather than synthetic data. The natural next step is assembling an INT8 `lenet5_top` that chains all seven INT8 IPs end-to-end (mirroring the existing float32 `lenet5_top.cpp`), to get one real utilization/timing/latency number for the complete quantized network on the PYNQ-Z2 target, the same way the float32 design's combined top-level numbers were reported above.
+
 **Next step**: C5 and F6 (both dense ReLU layers) are now done in INT8, joining C1, C3 (conv/MAC layers) and S2, S4 (pooling) — six of the network's seven layers. Only the output dense layer (softmax) remains; its softmax stage will need its own INT8-appropriate treatment (softmax doesn't requantize to int8 the same way ReLU layers do, per this project's own float32 optimization log for that layer above).
