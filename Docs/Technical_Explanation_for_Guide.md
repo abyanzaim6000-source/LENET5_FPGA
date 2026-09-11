@@ -721,3 +721,614 @@ The only remaining step this project has not attempted is physically loading thi
 bitstream onto a real ZedBoard and confirming it correctly classifies live camera or
 pre-loaded image data on actual hardware — which requires physical board access, separate
 from anything achievable through software tools alone.
+
+---
+
+## Part 9: Rebuilding for the Actual Target Board (PYNQ-Z2)
+
+After the bitstream described in Part 8 was generated, the project's guide asked a
+specific, important question before approving moving forward: which exact board and chip
+was this built for? This was a genuinely necessary check, and it uncovered a real mismatch
+that needed correcting before the bitstream could be considered final.
+
+### Why a "same chip family" bitstream can still be wrong for the actual board
+
+The chip inside a PYNQ-Z2 board and the chip this project had been targeting are both a
+"Xilinx Zynq-7020" — the same underlying computational fabric, same amount of LUTs,
+flip-flops, DSPs, and block RAM. However, physical chips are manufactured in different
+**packages** — the actual physical housing and pin layout — and a Zynq-7020 in a 484-pin
+package is genuinely a different physical part from a Zynq-7020 in a 400-pin package, even
+though the logic inside is equivalent. **A bitstream is compiled for one specific physical
+package and cannot be loaded onto a different one.** This project's earlier bitstream
+(Part 8) had been built for the 484-pin package (matching boards like the ZedBoard); the
+PYNQ-Z2 board actually uses the 400-pin package. Despite being logically the "same chip,"
+the earlier bitstream would not have been loadable onto a real PYNQ-Z2 board at all.
+
+### Getting the correct board information into the tools
+
+Vivado does not automatically know the specific wiring and configuration details of every
+possible board a chip might be mounted on — for that, it relies on a small file (a "board
+file") published by the board's manufacturer, describing exactly how the memory, clocks,
+and other components on that specific board are wired to the chip. The PYNQ-Z2's
+manufacturer (TUL Corporation, working with the open-source PYNQ project) publishes this
+file separately from Xilinx's own default installation. This file had to be located from
+its genuine, correct source and installed into Vivado before the tool could correctly
+configure the design for this specific board (in particular, the correct timing settings
+for the board's actual memory chip, which are load-bearing details that would be
+incorrect if left at generic defaults).
+
+### Confirming the existing design didn't need to be redesigned
+
+Before rebuilding anything, it was confirmed that the seven-layer network's own hardware
+description (the `lenet5_top` design from Parts 4 and 7) is written generically enough
+that it does not depend on the specific package or board at all — only on the general
+"Zynq" chip family. This meant the actual computational design did not need to be changed
+or re-verified in any way; only the final, board-specific implementation and bitstream
+generation steps needed to be redone, targeting the correct physical part.
+
+### A real, unrelated problem discovered and fixed along the way
+
+While this rebuild was in progress, a completely unrelated file belonging to this project
+(the very first convolution layer's source code, from Part 4) was found to have been
+accidentally overwritten with unrelated text from a different, unconnected piece of work
+happening elsewhere on the same computer at the same time — evidently the result of two
+separate work sessions unintentionally writing to the same file location. This was caught
+immediately via a routine check of what files had recently changed, the corrupted content
+was not acted upon in any way, and the correct, original file was recovered from the
+project's version-control history, where every previous correct version remains safely
+stored. This is worth recording honestly as a real lesson about running multiple
+work sessions on the same shared project folder at the same time: it's possible for
+completely unrelated work to accidentally collide, and routinely checking what has
+actually changed before trusting or building on top of it is a valuable habit, not
+unnecessary caution.
+
+### The corrected result, for the real board
+
+With the correct board file in place and a new, separate build specifically targeting the
+PYNQ-Z2's actual chip (`xc7z020clg400-1`), synthesis, implementation, and bitstream
+generation were re-run in full, and completed successfully with zero design-rule-check
+errors.
+
+| Metric | Original build (484-pin package) | PYNQ-Z2 build (400-pin package) |
+|---|---|---|
+| Worst setup slack (WNS) | +3.659 ns | +0.033 ns |
+| Worst hold slack (WHS) | +0.008 ns | +0.020 ns |
+| LUT usage | 55.3% | ~55% (essentially identical) |
+| FF usage | 38.6% | ~39% (essentially identical) |
+| DSP usage | 10.9% | ~11% (essentially identical) |
+| BRAM usage | 85.4% | ~85% (essentially identical) |
+
+**Both builds pass timing**, but it's worth being fully honest that the PYNQ-Z2 build's
+margins are noticeably tighter, especially the setup slack (+0.033ns, compared to the
+other build's +3.659ns) — both are genuinely positive and passing, but the PYNQ-Z2 result
+leaves very little room for error. This is a real, measured characteristic of this
+specific board's implementation, not a flaw in the design itself (the underlying logic and
+resource usage are essentially unchanged between the two builds) — most likely explained
+by the different package's slightly different physical layout leading to a different,
+somewhat less favorable arrangement of the same circuit during automatic placement. If
+this design is ever revisited, it would be worth re-running implementation once or twice
+more to see whether a different automatic placement attempt yields more comfortable
+margins, since Vivado's placement process is not perfectly deterministic between runs.
+
+### Status: a genuine, board-correct bitstream now exists
+
+This project now has a bitstream specifically and correctly built for the actual target
+board named by the project's guide (PYNQ-Z2), with confirmed, passing timing and
+resource utilization that comfortably fits the chip's real capacity. This is the version
+that should actually be used if and when physical hardware becomes available, rather than
+the earlier 484-pin-package bitstream from Part 8, which remains a valid demonstration of
+the same design but was never actually loadable onto this specific board.
+
+---
+
+## Part 10: Converting From Floating-Point to Real Integer Arithmetic (INT8/INT32)
+
+Everything described up to this point — every layer, the full combined network, both
+bitstreams — uses standard 32-bit floating-point numbers (`float`) throughout. This is the
+same kind of number Python and most everyday calculators use: capable of representing a
+huge range of values with fine precision, but comparatively expensive for an FPGA to do
+arithmetic with, since floating-point circuits are inherently more complex than plain
+integer circuits.
+
+Following further guidance from the project's guide, the next requirement was to convert
+the design to use **real integer arithmetic in the actual hardware** — specifically,
+8-bit integers for the weights and activations flowing between layers, and a wider 32-bit
+integer as the "running total" inside each layer's multiply-accumulate calculations (a
+wider accumulator is needed here for the same reason a calculator needs more digits of
+display than any single number you type into it — adding up many 8-bit products can
+produce a result too large to fit back into 8 bits until it's deliberately rescaled down
+again).
+
+**This is an important distinction from earlier work in this project**: the project had
+already explored 8-bit integer quantization extensively, but only as a **software
+simulation**, in Python — measuring what *would* happen to the network's accuracy if this
+representation were used, without ever actually building real integer-only circuits. This
+new phase asks for that same idea to be carried into the *actual synthesized hardware*
+for the first time.
+
+### Building and verifying the first converted layer
+
+Rather than converting all seven layers to integer arithmetic simultaneously, only the
+first convolution layer (C1) was converted first, deliberately kept as a new, separate
+file rather than modifying the working floating-point version — preserving the same
+"never overwrite a proven design, always add a new one to compare against" discipline used
+throughout this project. This meant that if anything went wrong with this conversion, the
+fully working, already-verified floating-point network (including both generated
+bitstreams) would remain completely unaffected and safe.
+
+**Correctness was verified to an unusually strict standard.** Because this is now genuine
+integer arithmetic rather than floating-point calculation, there is no room for the small,
+expected rounding differences that were considered normal and acceptable everywhere else
+in this document (recall Part 7's "difference of about 65 trillionths" being explicitly
+fine, since floating-point math legitimately has multiple valid orders of computation).
+Integer arithmetic has no such excuse — two implementations of the same integer
+calculation should produce **exactly, bit-for-bit identical results**, with zero
+tolerance for any difference at all. This layer's hardware output was compared against
+the equivalent Python calculation across every one of its 4,704 individual output values,
+and matched with **zero mismatches** — a stronger, more exact confirmation of correctness
+than anything else in this project, appropriate to the stricter nature of integer math.
+
+### The results: a genuine trade-off, not a simple win
+
+Converting to 8-bit integers produced a real, substantial reduction in three of the four
+main hardware resource categories, exactly as the technique is generally expected to
+deliver — smaller data values simply need less physical circuitry to store and move
+around:
+
+| Resource | Floating-point version | Integer version | Change |
+|---|---|---|---|
+| On-chip memory (BRAM) | 18 blocks (6%) | 5 blocks (1%) | 72% less |
+| Memory bits (FF) | 28,886 (27%) | 9,989 (9%) | 65% less |
+| General logic (LUT) | 19,572 (36%) | 16,519 (31%) | 16% less |
+| Multiply-hardware (DSP) | 14 (6%) | 13 (5%) | Barely changed — flagged as worth investigating further |
+
+**However, one genuinely unexpected and undesirable result also appeared: the design got
+slower, not faster** — total calculation time increased by roughly 94%, and (separately)
+the floating-point version's timing had actually been failing to meet the clock-speed
+target, while the integer version succeeded in meeting it. This needed proper
+investigation rather than being accepted or dismissed without explanation.
+
+### Diagnosing why integer arithmetic became slower
+
+The cause was tracked down to a specific, well-understood detail: even though the core
+multiply-accumulate calculation is now genuinely done in cheap integer arithmetic, the
+*very last step* of the calculation — converting the accumulated integer total back into
+a properly-scaled real-world value, so it can be correctly compared and passed to the next
+layer — still relies on a **floating-point division** operation. A single hardware
+division is a comparatively slow, expensive operation to compute (this project has
+encountered exactly this kind of cost before, in Part 3's discussion of accumulator
+latency, though this is a related but distinct issue — division specifically, not simply
+accumulation) — and having it appear once per output pixel prevented the surrounding
+calculation from being pipelined as efficiently as the floating-point version had been,
+becoming the new limiting factor on overall speed.
+
+**The proposed fix, not yet completed at time of writing**, is a standard, well-known
+hardware technique: instead of dividing by the same value repeatedly inside a loop, that
+value's *reciprocal* (one divided by it) can be calculated just **once**, ahead of time,
+and then every subsequent step can *multiply* by that reciprocal instead of dividing —
+multiplication is a much cheaper, more easily pipelined operation than division, even
+though the two approaches are mathematically equivalent. This fix has been identified and
+explained but deliberately not yet applied, since — following the same strict
+"bit-for-bit, not just approximately equal" verification standard established for this
+integer work — switching from division to reciprocal multiplication can, in principle,
+produce very slightly different floating-point results even though the two calculations
+represent the same mathematical operation, so this change needs the same rigorous
+re-verification against the Python reference before it can be trusted, rather than being
+assumed safe.
+
+**A second detail also flagged as worth further investigation**: the multiply-hardware
+(DSP) usage barely changed between the floating-point and integer versions (14 down to
+just 13), which is a smaller improvement than might be expected — Zynq-family chips are
+generally able to pack small integer multiplications more efficiently into their DSP
+hardware than full floating-point multiplication requires, so a larger reduction was
+anticipated. This has been flagged for further investigation to determine whether some of
+the requantization step's remaining floating-point arithmetic (the scale-factor
+multiplication/division discussed above) is still consuming DSP resources that a fully
+integer-only pipeline should not need at all.
+
+### Status at time of writing
+
+- Correctness of the first converted layer (C1): **confirmed**, to an exact, bit-for-bit
+  standard, against a real trained model's actual weights, across three successive
+  refinements described below.
+- Resource savings (BRAM, FF, LUT): **confirmed and substantial**, as expected for this
+  technique.
+- Speed and remaining DSP usage: **fully resolved** — see the two follow-up refinements
+  below.
+- Remaining six layers: **not yet converted** — this conversion is intentionally being
+  proven correct and well-understood on one layer first, following the same incremental
+  approach used successfully throughout this project, before being extended to the rest of
+  the network.
+
+### First refinement — replacing division with multiplication by its reciprocal
+
+The first proposed fix from above was carried out: the repeated floating-point division
+inside the per-pixel calculation was replaced with a single, one-time calculation of that
+value's reciprocal, followed by ordinary multiplication in its place everywhere the
+division used to happen.
+
+**Critically, this change was not assumed to be numerically identical to the original —
+it was checked.** Directly comparing the two approaches at the level of individual
+numbers showed that they genuinely do produce very slightly different results in a real
+portion of the data (roughly 11% of all values differed, by an extremely small amount,
+several millionths at most) — confirming this substitution is a genuine change in
+arithmetic, not a "free," perfectly invisible swap, even though the two operations are
+mathematically equivalent in ordinary, unlimited-precision arithmetic. Fortunately, this
+tiny divergence was confirmed to never actually change which final whole-number answer
+any value rounds to, so the overall calculation remained exactly correct — but this was
+established by direct checking, not assumed, and the Python reference calculation was
+correspondingly rebuilt to use the identical reciprocal-based arithmetic, so that the
+comparison being tested remained a fair, matching one.
+
+This change alone reduced total calculation time by about 20%, while leaving resource
+usage essentially unchanged, and preserving the design's ability to meet its clock speed
+target.
+
+**One further, precise finding came out of investigating why multiply-hardware (DSP)
+usage had barely improved earlier.** A detailed look at exactly which operations were
+still using DSP hardware revealed that the core multiply-accumulate array had, in fact,
+already become fully integer-based and used a sensible number of DSP units for its size —
+but several *additional* DSP units were still being consumed by leftover floating-point
+operations specifically inside the final rescaling step (the scale-factor multiplication,
+and a separate step handling correct rounding). This precisely explained the earlier
+puzzle, and pointed directly at the next, final refinement.
+
+### Second refinement — genuine fixed-point rescaling, eliminating floating-point entirely
+
+The final refinement replaced the floating-point rescaling step with a **true
+fixed-point** equivalent — a well-established, standard technique used in real
+commercial quantized-inference frameworks (the same general approach used inside
+Google's TensorFlow Lite, among others), where an arbitrary scaling factor is
+approximated not by a floating-point number at all, but by a specially chosen large whole
+number paired with a matching "shift" amount — such that multiplying by that whole number
+and then shifting the result produces the same effect as multiplying by the original
+scale factor, using only integer operations throughout, with no floating-point hardware
+involved anywhere in the calculation.
+
+**The correctness of this substitution was, once again, verified rather than assumed**,
+following the exact same rigorous process established for every step of this conversion:
+a Python version of this exact fixed-point arithmetic was built and checked first — including
+an explicit, automatically-verified check that reconstructing the original raw calculation
+from the new representation produces an exact match — before any of this logic was ported
+into the hardware description at all. The hardware version was then confirmed to match
+this new Python reference with, again, zero mismatches across every single output value.
+
+**The result closed every remaining gap, and the new integer version now outperforms the
+original floating-point design in every single measured respect:**
+
+| Metric | Original (floating-point) | Integer, first attempt | Integer, final version |
+|---|---|---|---|
+| On-chip memory (BRAM) | 18 (6%) | 5 (1%) | 5 (1%) |
+| Multiply-hardware (DSP) | 14 (6%) | 13 (5%) | **11 (5%)** |
+| Memory bits (FF) | 28,886 (27%) | 9,950 (9%) | 9,889 (9%) |
+| General logic (LUT) | 19,572 (36%) | 16,461 (30%) | 16,124 (30%)|
+| Calculation time (cycles) | 144,591 | 223,780 | **124,991** |
+| Meets clock speed target? | **No — failed by 2.36 ns** | Yes | Yes |
+| Maximum clock speed | 104.80 MHz | 136.99 MHz | 136.99 MHz |
+
+The final integer version is not just smaller (as expected from switching to a narrower
+number format), but also genuinely **faster** than the original floating-point design (a
+13.6% reduction in total calculation time) — and, notably, the *original floating-point
+version had actually been failing to meet its intended clock-speed target*, something not
+previously highlighted in this document, while every integer version successfully meets
+it. This is a strong, complete, and pleasantly surprising result: for this specific layer,
+switching to integer arithmetic turned out to improve every single property being
+measured, not merely trade size for speed or vice versa.
+
+**A final, precise explanation for the last few DSP units** — a natural remaining
+question, given the above table still shows a non-zero DSP count even in the fully
+fixed-point version — is worth recording clearly: those remaining DSP units are not
+leftover floating-point circuitry at all (the synthesis tool's own report confirms
+literally zero floating-point hardware cores exist anywhere in this final design). They
+are needed simply because the rescaling calculation still requires multiplying two
+reasonably large whole numbers together, and multiplying sufficiently large numbers
+together is an inherently DSP-costing operation on this chip regardless of whether those
+numbers represent an ordinary integer or a repurposed floating-point value — a subtle but
+important distinction: **DSP hardware cost is fundamentally about the width of a
+multiplication, not about which number format that multiplication happens to represent.**
+
+### Status, updated
+
+- Correctness: **confirmed at every stage**, to an exact, zero-mismatch standard.
+- Resource usage, speed, and timing closure: **fully resolved** — the final integer
+  version outperforms the original floating-point design in every measured category.
+- Remaining six layers: still **not yet converted** — the same three-stage refinement
+  process demonstrated here (naive floating-point rescale → reciprocal multiply →
+  genuine fixed-point) provides a proven, well-understood template ready to be applied to
+  the rest of the network next.
+
+A full, detailed numerical record of every individual experiment described in this
+document — including every attempt not elaborated on here in full narrative form — is
+maintained separately in the project's `Results/hls_results.md` file, which contains the
+complete, chronological, per-experiment data this summary is drawn from.
+
+### Extending the conversion to the rest of the network
+
+With the full three-stage technique proven and well understood on the first layer, the
+same approach — build and verify a Python reference first, confirm it matches an
+independent calculation exactly, only then translate the identical logic into the
+hardware description, and verify that translation is itself exact before trusting any
+resulting measurement — was repeated for each of the remaining layers in turn: both
+pooling layers, the second convolution layer, and two of the three fully-connected
+layers.
+
+**Every single one of these conversions produced the same broad result already
+established for the first layer**: substantial reductions in on-chip memory and register
+usage, and calculation speed that matched or improved upon the original floating-point
+version — with one further layer (the second convolution layer) also successfully
+carrying forward its own, separately-developed optimization (the earlier
+division-avoiding lookup-table technique from Part 4) *together with* this new integer
+conversion, confirming the two different kinds of optimization developed independently
+in this project are fully compatible with one another rather than working against each
+other.
+
+### A further, genuinely interesting finding: solving one bottleneck can reveal a different one
+
+While converting one of the fully-connected layers, a finding emerged that is worth
+explaining carefully, since it extends this document's earlier central discovery (Part 3)
+into new territory rather than simply repeating it.
+
+Recall from Part 3 that ordinary floating-point addition takes several clock cycles
+internally to produce its result, and that this specific cost was identified as the
+reason several layers' calculations could not be sped up past a certain point (an
+"Initiation Interval," or II, of 4), no matter how the calculation was restructured —
+this was described as a genuine hardware floor for floating-point arithmetic.
+
+**Plain integer addition does not have this same limitation** — adding two whole numbers
+together is a substantially simpler, faster operation for hardware to perform than adding
+two floating-point numbers, and does not carry the same multi-cycle internal delay.
+Consequently, once this particular fully-connected layer's calculations were converted to
+integer arithmetic, the specific bottleneck that had been limiting its speed throughout
+this entire project — the floating-point addition delay — genuinely became a non-issue.
+
+**However, removing one bottleneck does not automatically mean a calculation reaches its
+absolute best possible speed — it simply means whatever the next-most-limiting factor
+happens to be will now determine the result instead.** In this case, once the
+floating-point addition delay was no longer the limiting factor, the *original* kind of
+limitation encountered all the way back at the very beginning of this project's
+optimization work resurfaced: a memory array with only a small, fixed number of ports
+available for reading multiple values in the same clock cycle (see Part 2's explanation
+of `ARRAY_PARTITION`, and Part 4's account of C1's very first optimization attempt). This
+had never mattered for this particular layer while the floating-point addition delay was
+the dominant cost — but with that cost removed, it became the new, visible limit.
+
+This is a valuable, general lesson worth stating plainly: **fixing the most significant
+bottleneck in a design does not mean a design has no more bottlenecks — it means the
+*next* most significant one is now what determines performance, and that next bottleneck
+may belong to a completely different category of problem than the one just solved.** This
+project independently rediscovered this principle in two different forms — first when
+switching optimization *techniques* revealed a different limiting array (Part 4), and now
+again when switching *numeric representations* revealed a different limiting factor
+entirely. Both instances reinforce the same underlying truth about how hardware
+performance bottlenecks should be investigated: one at a time, by direct evidence, never
+assumed to be fully resolved just because a single fix improved things.
+
+### Status, updated again
+
+- Correctness across every converted layer: **confirmed**, to the same exact, zero-mismatch
+  standard established for the first layer, with each layer's own scale-conversion
+  behavior independently derived and verified rather than reused from another layer.
+- Resource usage, speed, and timing closure across every converted layer: **matches or
+  improves upon** the corresponding floating-point version in every case measured so far.
+- Compatibility with this project's other, independently-developed optimization
+  techniques (specifically, the second convolution layer's division-avoiding lookup-table
+  technique from Part 4): **confirmed compatible**, working correctly together in
+  combination.
+- Remaining work: the final fully-connected (classification) layer has not yet been
+  converted, and is expected to need additional care, since — as discussed in Part 4 — its
+  final "softmax" calculation step has a fundamentally different shape from every other
+  layer's calculation (it requires knowing every output value before correctly finishing
+  any single one of them), meaning the straightforward integer-conversion technique used
+  for every other layer cannot simply be copied without first thinking through how that
+  specific final step should be restructured.
+
+### The final layer, and a precisely-explained exception to the "everything shrinks" pattern
+
+The seventh and final layer (the network's classification output, ending in the
+"softmax" calculation first discussed in Part 4) was converted last, using the same
+careful, "think before implementing" approach as everywhere else in this project. A
+deliberate design decision was made and explained before any code was written: the raw
+multiply-accumulate portion of this layer was converted to genuine integer arithmetic,
+exactly like every other layer — but the final softmax normalization step was
+**deliberately kept in floating-point**, rather than being forced into the same
+integer/fixed-point treatment as everything else.
+
+The reasoning is worth stating plainly, since it illustrates good engineering judgment
+rather than a shortcut: the fixed-point rescaling technique used throughout this section
+exists specifically to avoid the cost of floating-point arithmetic on a calculation that
+repeats very many times, once for every single output value, across every single input
+image — exactly the situation in a convolution or dense layer's main calculation.
+Softmax, by contrast, runs only **once per classification**, on only ten values total —
+it is the network's very last step, read directly by whatever system or person is
+interpreting the result, not fed forward into another layer that would benefit from
+receiving an already-quantized integer value. Given this, converting it to fixed-point
+arithmetic would have added real design complexity and risk for a calculation that was
+never a meaningful contributor to the design's overall size or speed in the first place.
+
+**This layer was the one place in this entire integer-conversion effort where a resource
+count increased rather than decreased** — specifically, the amount of multiply-hardware
+(DSP) used went up slightly. This was not accepted as a mysterious side-effect; it was
+traced precisely, using the tool's own detailed internal reports, to three distinct,
+separately-understood causes: a genuine small saving in the main calculation (fewer DSP
+needed there, as in every other layer), an accounting relocation with no new hardware at
+all (an existing calculation's cost simply got counted in a different part of the design
+than before, because a floating-point calculation elsewhere in the same layer that it
+used to share hardware with no longer exists once that portion became integer-based), and
+one small, genuinely new piece of hardware needed to bridge the new integer calculation's
+result back into the floating-point value the unchanged softmax step expects. This last
+piece is a small, deliberate, and justified cost of the design decision explained above —
+not evidence that combining integer and floating-point arithmetic in one layer somehow
+doubles the real work involved.
+
+---
+
+## Part 11: Combining All Seven Converted Layers, and a Second Complete Bitstream
+
+With every individual layer's integer-arithmetic version built and verified, the same
+combination step already demonstrated in Part 7 for the original floating-point design
+was repeated for these seven new integer versions — chaining all seven into a single,
+complete network capable of taking in one handwritten digit image and producing a full
+classification result, entirely in integer arithmetic (aside from the one deliberately
+floating-point final step discussed above).
+
+### Verifying the combined design was correct, at every internal stage
+
+Rather than checking only the network's final answer, the combined design's testbench
+checked **every individual layer's output inside the chain**, not merely the end result —
+confirming zero mismatches at every stage from the first layer through the sixth, and
+confirming the final, deliberately floating-point classification stage matched to the
+same small, well-justified tolerance used throughout this integer-conversion work. This
+is a stronger verification standard than checking only the final answer, since it
+confirms every internal handoff between layers — including each layer's own,
+independently-derived scale-correction values — is being carried through correctly, not
+merely that any errors happened to cancel out by the time the final answer was reached.
+
+### Fitting on the chip — this time, comfortably, without complication
+
+Unlike the original floating-point combined design (Part 8), which required a real,
+documented detour (removing an attempted parallel-processing feature, then further
+optimizing one layer's internal arithmetic) before it could be made to fit within the
+target chip's capacity, this integer-based combined design **fit comfortably from the
+very first attempt**, using less than three-quarters of the chip's general logic capacity
+and well under a quarter of its on-chip memory — with no detours or additional
+optimization work required at all. This is a direct, practical demonstration of exactly
+the benefit integer arithmetic was expected to provide at the level of an entire network,
+not just one layer in isolation.
+
+### One further honest finding worth recording precisely
+
+Despite every individual layer's own computation logic being substantially smaller in
+its integer form, the *combined* design's general logic (LUT) usage barely changed
+compared to the original floating-point combined design — a result that, on first glance,
+seems to contradict everything else found in this section. This was investigated properly
+rather than left unexplained.
+
+**The cause turned out to be specific and well understood, not a flaw in the conversion
+technique itself.** Each layer's connection to the rest of the system (the same kind of
+memory connection discussed in Part 2) had, for simplicity, been set up to carry both a
+layer's weight values and its bias values together over one shared connection — a
+perfectly reasonable choice when those values were both the same, 32-bit floating-point
+format, as in the original design. Once the weight values became a much narrower 8-bit
+integer format while the bias values remained a wider format on the very same shared
+connection, the hardware's ability to efficiently pack multiple narrow values together
+when moving them to and from memory was lost, adding real, if avoidable, extra circuitry
+at exactly the boundary between each layer and the rest of the system. Summing just the
+computational core of all seven layers directly from the same report confirms their
+combined logic usage is, in fact, dramatically smaller, exactly as expected — the
+increase is entirely attributable to this specific, identified connection-sharing
+inefficiency, not to the integer arithmetic itself being larger than expected.
+
+This has been recorded as a known, well-understood, and low-priority opportunity for
+further improvement (separating each layer's weight and bias values onto their own,
+correctly width-matched connections would be expected to recover a meaningful portion of
+this cost) — but, since the combined design already comfortably fits the chip's capacity
+without this fix, it was deliberately not pursued immediately, in favor of completing and
+verifying the full, working hardware result first.
+
+### The final, complete result: a second real bitstream
+
+Following the exact same real-hardware validation process used for the original
+floating-point design (Part 9) — sourcing and confirming the correct PYNQ-Z2 board file,
+configuring the processor's high-performance memory connection, and working around the
+same known tool limitation with this design's many independently-named memory
+connections by wiring them explicitly rather than relying on automatic connection — a
+complete, real, physically valid bitstream was generated for this integer-arithmetic
+version of the network as well.
+
+**One additional, genuine practical obstacle was encountered and resolved along the
+way**: partway through this process, file generation began failing due to a length
+limit built into the Windows operating system itself, restricting how long a complete
+file path is allowed to be. This project's file and folder naming had, by this stage,
+grown descriptive enough (reasonably so, for clarity) that combined with this new
+design's own internal file-naming conventions, a small number of generated files ended up
+with names exceeding this limit. This was confirmed precisely, by directly measuring the
+problematic path length against the equivalent, working path from the original
+floating-point build, rather than guessed at — and resolved simply by shortening the new
+project's own folder and file names, which is a purely administrative fix with no
+bearing whatsoever on the correctness of the underlying design.
+
+**Final, real, place-and-routed results, compared directly against the original
+floating-point bitstream:**
+
+| Metric | Floating-point bitstream | Integer-arithmetic bitstream | Change |
+|---|---|---|---|
+| Worst setup slack (WNS) | +0.033 ns | **+0.121 ns** | More comfortable margin |
+| Worst hold slack (WHS) | +0.020 ns | +0.015 ns | Still positive, similarly tight |
+| General logic (LUT) | 55.3% | **31.8%** | 42.5% less |
+| Memory bits (FF) | 38.6% | **21.2%** | 45.1% less |
+| On-chip memory (BRAM) | 85.4% | **25.7%** | 69.9% less |
+| Multiply-hardware (DSP) | 10.9% | 20.9% | Higher — expected, and precisely explained above and throughout this section |
+
+Every single timing requirement is met, with **zero failing paths**, for this integer
+version as well — and, notably, its timing margin is measurably more comfortable than the
+original floating-point design's had been, addressing the earlier, honestly-recorded
+concern (Part 8) about that design's very thin safety margin.
+
+### Status: two complete, working, verified bitstreams now exist
+
+This project now has two full, real, physically-valid FPGA configurations for the
+complete seven-layer LeNet-5 network, targeting the actual PYNQ-Z2 board specified by the
+project's guide: one using standard floating-point arithmetic throughout, and one using
+genuine 8-bit integer arithmetic (matching the guide's specific request), verified
+correct against real trained weights and a real handwritten digit image, meeting every
+timing requirement, and — in the integer version's case — using substantially less of
+the chip's available hardware resources than the floating-point version required, while
+also running with a more comfortable timing margin.
+
+A full, detailed numerical record of this and every other individual experiment described
+in this document is maintained separately in the project's `Results/hls_results.md` file.
+
+### Extending the conversion to the rest of the network
+
+With the fixed-point technique proven correct and beneficial on C1, the same approach —
+build a Python reference first with its own independently-derived scale multiplier, verify
+that reference matches an independent cross-check exactly, only then port the identical
+arithmetic into HLS, and confirm an exact, zero-mismatch match before trusting any
+synthesis result — was repeated for each remaining layer in turn, chaining each layer's
+real output forward as the next layer's genuine test input (rather than artificial test
+values), so the whole growing pipeline was tested against realistic, real-world data at
+every stage.
+
+**Every layer converted so far has repeated the same encouraging pattern**: substantial
+reductions in on-chip memory and general logic usage, equal or improved calculation speed,
+and — consistently, across every single layer — a design that had been *failing* to meet
+its clock-speed target in floating-point now *passing* that same target once converted to
+integer arithmetic.
+
+**One genuinely new and instructive finding appeared while converting the first
+fully-connected (dense) layer, C5.** Recall from Part 3 of this document that the
+project's central floating-point finding was that a slow, multi-cycle floating-point
+addition operation was the limiting factor capping how quickly these calculations could
+be pipelined. Integer addition, by contrast, is a much simpler and faster operation for
+hardware to perform, with no equivalent multi-cycle delay. Once this layer's arithmetic
+was converted to integers, that specific limiting factor genuinely became less severe —
+and, as a direct result, a **different**, previously-hidden bottleneck was exposed instead:
+the same "not enough simultaneous memory read ports" limitation that this project first
+encountered and solved, right at the very beginning of this whole effort, in Part 4's
+discussion of the very first convolution layer.
+
+This is a valuable, concrete illustration of a general principle in hardware design worth
+stating plainly: **solving one bottleneck does not guarantee reaching the best possible
+result — it only reveals whatever the next most limiting factor happens to be**, which may
+turn out to be a completely different *category* of problem than the one just solved.
+This project has now demonstrated this same principle twice, in two different ways: once
+by discovering that partitioning the wrong array produces no benefit at all (Part 4), and
+now by discovering that removing a slow-arithmetic bottleneck can, by itself, unmask an
+entirely different, previously-irrelevant memory-access bottleneck underneath it.
+
+**Summary of layers converted to integer arithmetic so far:**
+
+| Layer | Resource change vs. floating-point | Speed change | Timing result |
+|---|---|---|---|
+| C1 (convolution) | Substantially smaller | 13.6% faster | Was failing target; now passes |
+| C3 (convolution) | Substantially smaller | 6.0% faster | Was failing target; now passes |
+| S2 (pooling) | Substantially smaller (comparison logic only) | Essentially unchanged | Already passing; still passes |
+| S4 (pooling) | Substantially smaller (comparison logic only) | Essentially unchanged | Already passing; still passes |
+| C5 (fully-connected) | Substantially smaller | 46.3% faster | Was failing target; now passes |
+| F6 (fully-connected) | Substantially smaller | 36.0% faster | Was failing target; now passes |
+| Output (final/softmax) | Mostly smaller, one small increase (explained below) | 32.1% faster | Was failing target; now passes |
+
+All seven layers have now been converted and individually verified — the final layer
+(Output) is discussed in its own dedicated section immediately below, since, as expected
+going in, its "softmax" step needed a distinct design decision rather than the same
+simple "multiply-accumulate, then rescale" pattern used for the other six.
