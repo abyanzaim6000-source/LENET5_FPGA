@@ -904,4 +904,53 @@ Max absolute difference across all 10 outputs is 1.19e-7 — single-precision fl
 
 **Next step**: all seven layers of the network (C1, C3 — conv/MAC; S2, S4 — pooling; C5, F6, Output — dense) now have INT8 implementations, each independently verified against its own from-scratch Python reference and chained through the real upstream int8 pipeline rather than synthetic data. The natural next step is assembling an INT8 `lenet5_top` that chains all seven INT8 IPs end-to-end (mirroring the existing float32 `lenet5_top.cpp`), to get one real utilization/timing/latency number for the complete quantized network on the PYNQ-Z2 target, the same way the float32 design's combined top-level numbers were reported above.
 
+## LeNet-5 Combined Top-Level — INT8 Quantization (new, PYNQ-Z2 target)
+
+New files, `lenet5_top.cpp`/`.h` never touched, same convention as every other INT8 IP in this project: `hls/lenet5_top_int8/src/lenet5_top_int8.cpp`/`.h`, `hls/lenet5_top_int8/tb/generate_test_data_int8.py`/`lenet5_top_int8_test_data.h`/`lenet5_top_int8_tb.cpp`, `hls/lenet5_top_int8/run_hls_int8_pynqz2.tcl` (`xc7z020clg400-1`, same PYNQ-Z2 part as every other INT8 build). Chains the 7 already-proven INT8 IPs (`conv_c1_int8_fixedpoint`, `pool_s2_int8`, `conv_c3_int8_fixedpoint` — LUT-decode architecture, `pool_s4_int8`, `dense_c5_int8_fixedpoint`, `dense_f6_int8_fixedpoint`, `dense_output_int8`) with the exact same structure `lenet5_top.cpp` uses for the float32 IPs: DATAFLOW-free sequential scheduling, one `m_axi` bundle per layer (weights+bias+that layer's own `requant_mult`/`requant_shift` scalars), local burst-copy buffers, literal-dimension forward declarations (each INT8 layer's own header reuses macro names like `IN_H`/`N_IN` for different values, so they can't all be `#include`d into one translation unit — identical reasoning to the float32 top). Every conv/dense layer's `requant_mult`/`requant_shift` (or, for the Output layer, `x_scale`/`w_scale`) is a top-level runtime input, independently derived from that layer's own real activation range — never hardcoded, never reused across layers.
+
+### Python reference built and verified FIRST, chaining a real MNIST image through the full C1→S2→C3→S4→C5→F6→Output int8 pipeline
+
+`generate_test_data_int8.py` duplicates every per-layer generator script's `quantize_multiplier()`/`requantize_fixed()`/accumulator-recovery-assert pattern used throughout this INT8 phase, chained end-to-end from a real MNIST test[0] image and the real trained `Models/lenet5_relu.keras` weights (not synthetic data at any stage). Every intermediate activation (C1, S2, C3, S4, C5, F6 outputs) is captured for the testbench to check bit-exact, in addition to the final softmax reference. Predicted label 7 matches the MNIST true label (confidence 99.99%), consistent with every prior single-layer INT8 testbench that used the same image.
+
+### C-simulation: every intermediate stage bit-exact, final softmax within tolerance
+
+`lenet5_top_int8_tb.cpp` calls each of the 7 INT8 kernels directly (not just through the combined top) to verify every intermediate activation against the Python reference with exact integer equality, then separately calls the actual `lenet5_top_int8()` IP end-to-end and checks its final result against the same tolerance standard `dense_output_int8_tb.cpp` uses (1e-5):
+
+```
+C1 stage mismatches: 0 / 4704
+S2 stage mismatches: 0 / 1176
+C3 stage mismatches: 0 / 1600
+S4 stage mismatches: 0 / 400
+C5 stage mismatches: 0 / 120
+F6 stage mismatches: 0 / 84
+HLS predicted class: 7 (Python int8 chain predicted: 7, MNIST true label: 7)
+Max abs diff vs. Python reference: 1.19209e-07
+TEST PASSED
+```
+
+Zero mismatches at every intermediate stage — the combined top's own local buffers/AXI plumbing introduce no discrepancy versus each layer's own already-proven standalone behavior. The final softmax matches to 1.19e-7, an order of magnitude tighter than the 1e-5 threshold and in the same range as this project's other float-finish comparisons (`dense_output_int8_tb.cpp`, the float32 `lenet5_top_tb.cpp`'s 6.55e-11).
+
+### C-synthesis: succeeded, fits the xc7z020 on every metric — no DATAFLOW-removal detour needed
+
+| Metric | float32 (`lenet5_top`, current baseline) | int8 (`lenet5_top_int8`) | Available (`xc7z020clg400-1`) |
+|---|---|---|---|
+| Latency = Interval | 496,750 cycles (4.967 ms @ 100MHz) | 344,432 cycles (3.444 ms @ 100MHz) | — |
+| Estimated Fmax | 103.49 MHz | 136.99 MHz | clears 100MHz target |
+| DSP | 24 (11%) | **44 (20%)** | 220 |
+| FF | 39,688 (37%) | **21,531 (20%)** | 106,400 |
+| BRAM_18K | 232 (82%) | **65 (23%)** | 280 |
+| **LUT** | **37,974 (71%)** | **39,289 (73%)** | 53,200 |
+
+`Loop Constraint Status: All loop constraints were NOT satisfied` appears in the log, same as every accumulator-bound INT8 layer's own build (C1, C3, C5, F6's own logs above) — this is the known II-limited MAC recurrence, not a timing violation; Fmax (136.99 MHz) clears the 100MHz target with margin.
+
+**Findings:**
+
+1. **Fits on every metric, comfortably, without the DATAFLOW-removal detour** the float32 design needed (see "EXPLORED, REVERTED" above) — this combined design was DATAFLOW-free from the start, and confirmed by actual synthesis, not assumed: LUT is the tightest metric at 73% (39,289/53,200), with real margin on DSP (20%), FF (20%), and BRAM (23%).
+2. **FF and BRAM drop sharply, as expected from summing each layer's own INT8 conversion win** (FF −45.7%, BRAM −72.0% vs the float32 combined top) — every local buffer and pipeline register is now 8/32-bit integer instead of 32-bit float, the same mechanism documented at every individual layer above.
+3. **LUT did NOT drop — it went up slightly (37,974→39,289, +3.5%), the one metric that bucks the per-layer trend.** Individually, every INT8 conv/dense layer's own LUT cost is far below its float32 counterpart (e.g. C1 16,124 vs C1 float32's much larger systolic cost, C3 4,919 vs 29,514 pre-LUT-decode) — summing just the 7 layer-core module rows from this build's own report gives only ~21,469 LUT, well under half the total. The rest (~17,800 LUT) is AXI-adapter/burst-copy glue: the `M_AXI Burst Information` section of this build's `csynth.rpt` flags a "Could not widen" note on **every single weight/bias copy loop** (`c1_weights`, `c1_bias`, `c3_weights`, ... `output_bias`, `image`) — each `m_axi` bundle mixes 8-bit weight arrays with a 32-bit bias array (to keep the float32 top's exact one-bundle-per-layer convention), so the AXI data width gets forced to 32 bits for bundles that are mostly 8-bit payload, and per-byte burst adapters can't merge multiple int8 elements into one 32-bit beat the way a native 32-bit float bundle already could. This is a real, structural cost of literally reusing the float32 top's bundling scheme unchanged for now-narrower data types — not a flaw in any individual INT8 layer's own design.
+4. **DSP goes up (24→44, +83.3%)**, the other metric that bucks the per-layer trend, but for a different, already-documented reason: `dense_output_int8` alone costs 16 DSP (vs float32 `dense_output`'s 14, per that layer's own log above — the softmax stage's float finish costs more DSP than its float32 counterpart's, a known and accepted trade documented there), and every conv/dense layer's own fixed-point rescale multiply (the genuine int64×int32 Q31 multiplier) costs 3–4 DSP per layer that the float32 layers' plain `ReLU` compare never needed. Even so, 44/220 (20%) leaves ample headroom — DSP was never close to a binding constraint for either version.
+5. **Latency drops 30.7%** (496,750→344,432 cycles) even carrying the extra AXI-adapter LUT cost above — every individual INT8 layer's own MAC/pooling/compare datapath is faster than its float32 counterpart (narrower integer arithmetic resolves quicker than the float32 pipelines it replaces), and that per-layer latency win dominates over any AXI-adapter overhead, which only affects area, not the sequential critical path.
+
+**Not attempted this pass**: splitting the mixed int8/int32 per-layer bundles into same-width bundles (e.g. one 8-bit-only bundle for all weights, one 32-bit-only bundle for all biases) to let the AXI burst inference actually widen the int8 transfers — the design fits comfortably without it, so it's a legitimate next lever for LUT margin, not a requirement. Also not attempted: Vivado IP packaging / block-design integration / bitstream generation for this INT8 top, held back pending explicit go-ahead per this phase's own scope (C-simulation and C-synthesis only).
+
 **Next step**: C5 and F6 (both dense ReLU layers) are now done in INT8, joining C1, C3 (conv/MAC layers) and S2, S4 (pooling) — six of the network's seven layers. Only the output dense layer (softmax) remains; its softmax stage will need its own INT8-appropriate treatment (softmax doesn't requantize to int8 the same way ReLU layers do, per this project's own float32 optimization log for that layer above).
