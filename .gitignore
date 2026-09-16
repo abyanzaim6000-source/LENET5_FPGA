@@ -24,3 +24,7 @@ weights/
 # Nested duplicate clone / HLS temp
 LENET5_FPGA/
 Lenet5_fpga_top/*.xpr.lock
+
+# Generated side-by-side feature-map matrices (dump_feature_maps.py) --
+# regenerated from the csim dumps + the reference header, never hand-edited.
+**/feature_maps/
