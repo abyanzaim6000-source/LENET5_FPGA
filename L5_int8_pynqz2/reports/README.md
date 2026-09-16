@@ -54,8 +54,8 @@ Run from this directory, in order:
 **Result: SUCCESS**, and with noticeably MORE timing margin than the float32
 PYNQ-Z2 build: **WNS +0.121060 ns, WHS +0.015439 ns** (float32: +0.033169 ns /
 +0.020045 ns). Both are real post-implementation results, on the same part, at
-the same 100 MHz target, so they compare directly. All user-specified timing
-constraints met, 0 failing endpoints on setup, hold, or pulse-width.
+the same 100 MHz target. All user-specified timing constraints met, 0 failing
+endpoints on setup, hold, or pulse-width.
 
 | Resource | float32 (`Lenet5_fpga_top_pynqz2`) | int8 (this build) | Change |
 |---|---|---|---|
