@@ -1,5 +1,7 @@
 #include <iostream>
 #include <cmath>
+#include <fstream>
+#include <iomanip>
 #include <ap_int.h>
 #include "../src/lenet5_top_int8.h"
 #include "lenet5_top_int8_test_data.h"
@@ -57,6 +59,72 @@ void dense_f6_int8_fixedpoint(
     ap_int<8>  requant_shift,
     ap_int<8>  output[84]
 );
+
+// ---- Per-layer activation dump (live-demonstration support) ----------
+// In ADDITION to the pass/fail checks below (which are unchanged), every
+// layer's ACTUAL computed output is written out as a plain text file --
+// one file per layer -- so the HLS side of the comparison can be read
+// directly and tabulated against the Python reference by
+// tb/compare_hls_vs_python.py.
+//
+// Files are written with plain relative filenames into the current
+// working directory, which under Vitis HLS is the C-simulation's own
+// build directory (<proj>/solution1/csim/build). No directories are
+// created, so this behaves identically under Vitis HLS on Windows and
+// under a plain g++ build on Linux/macOS.
+//
+// Format: a few '#' comment lines recording layer name, shape, value
+// count and dtype, then one value per line in row-major (C) order -- the
+// same order NumPy's .flatten() produces for that same shape, which is
+// what makes the element-by-element comparison against the Python
+// reference well-defined.
+#define DUMP_C1     "hls_c1_out.txt"
+#define DUMP_S2     "hls_s2_out.txt"
+#define DUMP_C3     "hls_c3_out.txt"
+#define DUMP_S4     "hls_s4_out.txt"
+#define DUMP_C5     "hls_c5_out.txt"
+#define DUMP_F6     "hls_f6_out.txt"
+#define DUMP_OUTPUT "hls_output_out.txt"
+
+static void dump_header(std::ofstream &f, const char *layer,
+                        const char *shape, int count, const char *dtype) {
+    f << "# layer: " << layer << "\n";
+    f << "# shape: " << shape << "\n";
+    f << "# count: " << count << "\n";
+    f << "# dtype: " << dtype << "\n";
+    f << "# order: row-major (C order), matches NumPy .flatten() on this shape\n";
+}
+
+static void dump_int8_layer(const char *filename, const char *layer,
+                            const char *shape, const ap_int<8> *data, int count) {
+    std::ofstream f(filename);
+    if (!f) {
+        std::cout << "WARNING: could not open " << filename << " for writing"
+                  << std::endl;
+        return;
+    }
+    dump_header(f, layer, shape, count, "int8");
+    for (int i = 0; i < count; i++) f << data[i].to_int() << "\n";
+    std::cout << "  dumped " << layer << " -> " << filename
+              << "  (" << count << " values)" << std::endl;
+}
+
+static void dump_float_layer(const char *filename, const char *layer,
+                             const char *shape, const float *data, int count) {
+    std::ofstream f(filename);
+    if (!f) {
+        std::cout << "WARNING: could not open " << filename << " for writing"
+                  << std::endl;
+        return;
+    }
+    dump_header(f, layer, shape, count, "float32");
+    // Scientific with 9 significant digits: enough to round-trip a float32
+    // exactly, so the dumped file loses nothing the tolerance check needs.
+    f << std::scientific << std::setprecision(9);
+    for (int i = 0; i < count; i++) f << data[i] << "\n";
+    std::cout << "  dumped " << layer << " -> " << filename
+              << "  (" << count << " values)" << std::endl;
+}
 
 int main() {
     // ---- Static top-level buffers, loaded once from the auto-generated
@@ -121,6 +189,7 @@ int main() {
     static ap_int<8> c1_out[28][28][6];
     conv_c1_int8_fixedpoint(image, c1_weights, c1_bias,
                              C1_REQUANT_MULT, C1_REQUANT_SHIFT, c1_out);
+    dump_int8_layer(DUMP_C1, "C1", "28x28x6", &c1_out[0][0][0], 28 * 28 * 6);
     {
         int mismatches = 0;
         for (int r = 0; r < 28; r++)
@@ -133,6 +202,7 @@ int main() {
 
     static ap_int<8> s2_out[14][14][6];
     pool_s2_int8(c1_out, s2_out);
+    dump_int8_layer(DUMP_S2, "S2", "14x14x6", &s2_out[0][0][0], 14 * 14 * 6);
     {
         int mismatches = 0;
         for (int r = 0; r < 14; r++)
@@ -146,6 +216,7 @@ int main() {
     static ap_int<8> c3_out[10][10][16];
     conv_c3_int8_fixedpoint(s2_out, c3_weights, c3_bias,
                              C3_REQUANT_MULT, C3_REQUANT_SHIFT, c3_out);
+    dump_int8_layer(DUMP_C3, "C3", "10x10x16", &c3_out[0][0][0], 10 * 10 * 16);
     {
         int mismatches = 0;
         for (int r = 0; r < 10; r++)
@@ -158,6 +229,7 @@ int main() {
 
     static ap_int<8> s4_out[5][5][16];
     pool_s4_int8(c3_out, s4_out);
+    dump_int8_layer(DUMP_S4, "S4", "5x5x16", &s4_out[0][0][0], 5 * 5 * 16);
     {
         int mismatches = 0;
         for (int r = 0; r < 5; r++)
@@ -177,6 +249,7 @@ int main() {
     static ap_int<8> c5_out[120];
     dense_c5_int8_fixedpoint(flat, c5_weights, c5_bias,
                               C5_REQUANT_MULT, C5_REQUANT_SHIFT, c5_out);
+    dump_int8_layer(DUMP_C5, "C5", "120", &c5_out[0], 120);
     {
         int mismatches = 0;
         for (int j = 0; j < 120; j++)
@@ -188,6 +261,7 @@ int main() {
     static ap_int<8> f6_out[84];
     dense_f6_int8_fixedpoint(c5_out, f6_weights, f6_bias,
                               F6_REQUANT_MULT, F6_REQUANT_SHIFT, f6_out);
+    dump_int8_layer(DUMP_F6, "F6", "84", &f6_out[0], 84);
     {
         int mismatches = 0;
         for (int j = 0; j < 84; j++)
@@ -212,6 +286,7 @@ int main() {
                      f6_weights, f6_bias, F6_REQUANT_MULT, F6_REQUANT_SHIFT,
                      output_weights, output_bias, OUTPUT_X_SCALE, OUTPUT_W_SCALE,
                      result);
+    dump_float_layer(DUMP_OUTPUT, "Output", "10", &result[0], 10);
 
     std::cout << "HLS result:      ";
     float sum = 0.0f;
