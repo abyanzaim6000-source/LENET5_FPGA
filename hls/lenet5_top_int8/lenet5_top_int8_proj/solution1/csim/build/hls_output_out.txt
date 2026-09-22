@@ -1,0 +1,15 @@
+# layer: Output
+# shape: 10
+# count: 10
+# dtype: float32
+# order: row-major (C order), matches NumPy .flatten() on this shape
+4.041643908e-009
+7.134540851e-007
+2.388941311e-006
+7.280804130e-005
+5.209648251e-012
+3.071411925e-007
+9.443048773e-012
+9.999237061e-001
+8.003291185e-008
+4.103100437e-008
