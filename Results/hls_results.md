@@ -816,9 +816,12 @@ DSP total again lands exactly unchanged (11→11) — same coincidence as C5, th
 2. **The memory-port-limited II=2 floor is independent of N_IN** (120 here vs. C5's 400) — same mechanism, same final II, consistent with C5's own finding that this is a port-count property of the `ap_memory` interface, not something that scales with problem size.
 3. **DSP staying exactly flat (11→11) at both C5 and F6, despite the two designs splitting those DSPs differently between the MAC array and the rescale multiply**, is the first time in this project's INT8 conversion that resource neutrality (rather than a clear reduction) is the headline DSP result — still a strict win overall given the simultaneous latency, FF, LUT, and timing improvements.
 
+**Next step**: Output is the last layer — same PE_COUNT=4 architecture for its MAC stage, but its softmax activation doesn't fit the ReLU-requantize pattern C1/C3/C5/F6 all share, so it needs its own design (see below).
 
 
 ## Output Dense (Softmax) — INT8 Quantization (new, PYNQ-Z2)
+
+### Plain INT8 (`dense_output_int8`) — complete
 
 Unlike every earlier INT8 layer (C1, C3, C5, F6), this is deliberately **not** a "`_fixedpoint`" design, and the reasoning is worth stating before the implementation: fixed-point rescaling exists in this project specifically to avoid floating-point cost on a *repeated, per-pixel* datapath that feeds another quantized layer — that's what justified paying for `quantize_multiplier()`'s Q31-mantissa-plus-shift machinery at every earlier stage. The Output layer's softmax is the network's **final** activation: its result is read as a probability distribution by a human or a downstream host, not fed forward into another int8 MAC, and it runs on only `N_OUT=10` values once per inference, not once per pixel. Paying fixed-point complexity for that would add hardware cost for no benefit. So this IP keeps the proven float32 `dense_output.cpp`'s own two-stage structure exactly, changing only Stage 1's datapath:
 
@@ -904,6 +907,60 @@ Max absolute difference across all 10 outputs is 1.19e-7 — single-precision fl
 
 **Next step**: all seven layers of the network (C1, C3 — conv/MAC; S2, S4 — pooling; C5, F6, Output — dense) now have INT8 implementations, each independently verified against its own from-scratch Python reference and chained through the real upstream int8 pipeline rather than synthetic data. The natural next step is assembling an INT8 `lenet5_top` that chains all seven INT8 IPs end-to-end (mirroring the existing float32 `lenet5_top.cpp`), to get one real utilization/timing/latency number for the complete quantized network on the PYNQ-Z2 target, the same way the float32 design's combined top-level numbers were reported above.
 
+### Fixed-point (`dense_output_int8_fixedpoint`) — in progress
+
+**Not a drop-in copy of C5's/F6's int8 pattern.** Softmax needs the sum of every output neuron's exponential before any one of them can be normalized — the same reason the float32 `dense_output.cpp` is already two explicit stages instead of one fused MAC-then-activate loop (see that layer's own optimization log above). The int8 version keeps that two-stage shape, but now Stage 1 is genuine integer arithmetic and Stage 2 is a deliberate float step:
+
+- **Stage 1 (MAC)** — the same proven PE_COUNT=4 partial-sum split as `dense_c5_int8_fixedpoint.cpp`/`dense_f6_int8_fixedpoint.cpp`, pure `int8×int8→int32` arithmetic, into a small local `logits_int[10]` array. Deliberately **no ReLU and no requantize-to-int8** here (unlike C5/F6): softmax needs the full-precision accumulator, not an int8-rounded value, and there's no next INT8 layer downstream to requantize *for* — this is the network's last layer.
+- **Stage 2 (softmax)** — dequantizes each of the 10 raw accumulators to float with a single multiply by `combined_scale` (`x_scale*w_scale`, precomputed offline exactly like `requant_mult`/`requant_shift` are for the other INT8 layers), then runs the exact same max-subtract/exp/sum/divide as the proven float32 `dense_output.cpp`.
+
+**Why Stage 2 does NOT use the TFLite/gemmlowp Q31 mantissa-and-shift technique** C1/C3/C5/F6 all use for their ReLU requantize: that machinery exists specifically to keep floating-point hardware *out of a repeated, per-cycle-critical loop* (per-pixel for a conv, per-tap × N_IN/N_OUT for a dense MAC's reduction). Stage 2 here runs exactly **once** per inference over just 10 values — a dequantize multiply, a max, 10 `exp`s, a sum, 10 divides. That's negligible resource/timing cost either way, so forcing it through int64 fixed-point buys nothing and only makes the reference harder to verify. A plain float dequantize followed by float softmax — identical math to the float32 `dense_output.cpp`'s own Stage 2 — is the actually-simpler, actually-cheaper design at this specific point in the pipeline. Output stays `float[10]` (final probabilities): there's nothing further downstream to requantize to int8 *for*, and the float32 version already returns float probabilities too.
+
+**Files added (existing float32 variant — `dense_output.cpp` — stays untouched):**
+- `hls/dense_output/src/dense_output_int8_fixedpoint.h`, `hls/dense_output/src/dense_output_int8_fixedpoint.cpp`
+- `hls/dense_output/tb/dense_output_int8_fixedpoint_tb.cpp`, `hls/dense_output/tb/generate_test_data_int8_fixedpoint.py`, `hls/dense_output/tb/dense_output_int8_fixedpoint_test_data.h`
+- `hls/dense_output/run_hls_int8_fixedpoint_pynqz2.tcl` — new solution, `dense_output_int8_fixedpoint_proj`, PYNQ-Z2 part (`xc7z020clg400-1`)
+
+### Python reference built and verified FIRST, chaining the real C1→S2→C3→S4→C5→F6 int8 pipeline
+
+Same rigor as every prior stage: Output's real 84-element input is F6's own real int8 output, produced by re-running the full C1→S2→C3→S4→flatten→C5→F6 int8 pipeline fresh in this script (not imported). **Output's own quantization is derived and verified completely independently** of every earlier layer:
+
+- Output's weights quantized fresh via `quantize_int_real()`; Output's *input* scale is F6's own `out_scale`.
+- Output's raw int32 accumulator recovered from `dense_int()`'s float output via its exact inverse, and the round-trip **verified exact**:
+  ```
+  Output accumulator recovery verified exact. acc range: [-60804, 65305]
+  ```
+- Dequantizing the recovered accumulator with `combined_scale` reproduces `dense_int()`'s own float output exactly (`np.array_equal`, not a tolerance) — confirms Stage 2's starting point is bit-identical to Stage 1's true integer accumulator, not an approximation of it.
+- **Cross-check #1**: the reference softmax (max-subtract/exp/sum/divide, computed by hand in the generator) compared against `dense_int(..., activation="softmax")` — the project's own reference implementation, computed via a fully independent code path (not derived from the recovered accumulator at all): **max abs diff = 0.0**.
+- **Cross-check #2**: `manual_layers.py` has no standalone `softmax()` to compare against (only `dense()`'s inline branch), so this cross-check is skipped and noted as such in the generator's own output — cross-check #1 already independently confirms the softmax math against the project's other reference implementation.
+- Real-data sanity check: predicted class **7**, true MNIST test[0] label **7** — **correct**, and the probability distribution (`[4.0e-9, 7.1e-7, 2.4e-6, 7.3e-5, 5.2e-12, 3.1e-7, 9.4e-12, 0.99992, 8.0e-8, 4.1e-8]`) is close to bit-identical to the float32 pipeline's own reported result for the same image (`lenet5_top`'s combined-network log above: `0.99992` for class 7) — strong end-to-end evidence the int8 chain preserves the trained network's real behavior, not just individual layers in isolation.
+
+### Local algorithm sanity check (NOT a substitute for real HLS C-simulation)
+
+Vitis HLS is not available in this environment (same limitation noted for every prior INT8 stage's initial build — see F6/Output's original float32 development above). Before leaving the real HLS run for the PYNQ-Z2-equipped machine, the C++ kernel's *algorithm* (not its HLS-specific bit-width/timing behavior) was sanity-checked locally: `ap_int<N>` was stood in for by a minimal wrapper (plain arithmetic, no real bit-width truncation/saturation semantics — genuinely not equivalent to Vitis's `ap_int`, only used to get the exact same C++ control flow to compile and run under g++), compiled against the real generated test data, and run:
+
+```
+Total output elements: 10
+Mismatches (tolerance 1e-05): 0
+Max abs diff: 1.19209e-07
+Sum of outputs: 1 (expected ~1.0)
+Predicted label: 7 (Python reference: 7, true label: 7)
+TEST PASSED -- HLS int8 Output matches Python reference within tolerance, sums to 1.0, and predicts the same class
+```
+
+The 1.19e-7 max diff is exactly one float32 ULP at this magnitude — consistent with NumPy's vectorized `exp()` vs. C++'s scalar `std::exp()` differing in their last bit, not a logic error. This confirms the kernel's control flow and arithmetic sequence match the Python reference; it does **not** confirm real `ap_int<8>`/`ap_int<32>` synthesis behavior (overflow/truncation edge cases), which — same as every earlier INT8 stage in this log — needs the actual Vitis HLS C-simulation to close out.
+
+### C-simulation / C-synthesis: PENDING real Vitis HLS run
+
+Unlike C1/S2/S4/C3/C5/F6 above, this stage's C-sim/C-synth numbers are not yet in this log — they need to be run on the PYNQ-Z2-equipped machine (`run_hls_int8_fixedpoint_pynqz2.tcl`, same as every other INT8 stage's script), same convention as the float32 F6/Output layers' own first commit before their real Vitis numbers were pulled in. Expect based on C5's/F6's own pattern: the accumulator-recurrence bottleneck that limited float32 `dense_output` (Stage 1 II=4, same `fadd`-latency mechanism as `dense_c5_partialsum`/`dense_f6`) should resolve to int8's memory-port-limited II=2 floor for Stage 1, same as C5/F6; Stage 2's softmax is a small, one-shot, largely-serial float computation over 10 elements and isn't expected to be a resource or II bottleneck at either precision (matching the float32 version's own "Confirmed" note on its exp+sum stage).
+
+### Utilization — float32 (`dense_output`) vs int8 (`dense_output_int8_fixedpoint`)
+
+*Pending the real Vitis HLS run above — will be filled in with the same DSP/FF/LUT/latency/II/timing/Fmax table format as C1/S2/S4/C3/C5/F6, plus the DSP breakdown (PE array vs. Stage 2's float exp/divide units) once available.*
+
+**Next step**: this is the one still-open individual-layer item — needs its real Vitis HLS C-sim/C-synth run on the PYNQ-Z2-equipped machine. Note the combined top-level network below was already assembled and bitstream-built using the *plain* `dense_output_int8` (not this fixed-point variant), so this run is a refinement, not a blocker for hardware bring-up.
+
+
 ## LeNet-5 Combined Top-Level — INT8 Quantization (new, PYNQ-Z2 target)
 
 New files, `lenet5_top.cpp`/`.h` never touched, same convention as every other INT8 IP in this project: `hls/lenet5_top_int8/src/lenet5_top_int8.cpp`/`.h`, `hls/lenet5_top_int8/tb/generate_test_data_int8.py`/`lenet5_top_int8_test_data.h`/`lenet5_top_int8_tb.cpp`, `hls/lenet5_top_int8/run_hls_int8_pynqz2.tcl` (`xc7z020clg400-1`, same PYNQ-Z2 part as every other INT8 build). Chains the 7 already-proven INT8 IPs (`conv_c1_int8_fixedpoint`, `pool_s2_int8`, `conv_c3_int8_fixedpoint` — LUT-decode architecture, `pool_s4_int8`, `dense_c5_int8_fixedpoint`, `dense_f6_int8_fixedpoint`, `dense_output_int8`) with the exact same structure `lenet5_top.cpp` uses for the float32 IPs: DATAFLOW-free sequential scheduling, one `m_axi` bundle per layer (weights+bias+that layer's own `requant_mult`/`requant_shift` scalars), local burst-copy buffers, literal-dimension forward declarations (each INT8 layer's own header reuses macro names like `IN_H`/`N_IN` for different values, so they can't all be `#include`d into one translation unit — identical reasoning to the float32 top). Every conv/dense layer's `requant_mult`/`requant_shift` (or, for the Output layer, `x_scale`/`w_scale`) is a top-level runtime input, independently derived from that layer's own real activation range — never hardcoded, never reused across layers.
@@ -951,6 +1008,8 @@ Zero mismatches at every intermediate stage — the combined top's own local buf
 4. **DSP goes up (24→44, +83.3%)**, the other metric that bucks the per-layer trend, but for a different, already-documented reason: `dense_output_int8` alone costs 16 DSP (vs float32 `dense_output`'s 14, per that layer's own log above — the softmax stage's float finish costs more DSP than its float32 counterpart's, a known and accepted trade documented there), and every conv/dense layer's own fixed-point rescale multiply (the genuine int64×int32 Q31 multiplier) costs 3–4 DSP per layer that the float32 layers' plain `ReLU` compare never needed. Even so, 44/220 (20%) leaves ample headroom — DSP was never close to a binding constraint for either version.
 5. **Latency drops 30.7%** (496,750→344,432 cycles) even carrying the extra AXI-adapter LUT cost above — every individual INT8 layer's own MAC/pooling/compare datapath is faster than its float32 counterpart (narrower integer arithmetic resolves quicker than the float32 pipelines it replaces), and that per-layer latency win dominates over any AXI-adapter overhead, which only affects area, not the sequential critical path.
 
-**Not attempted this pass**: splitting the mixed int8/int32 per-layer bundles into same-width bundles (e.g. one 8-bit-only bundle for all weights, one 32-bit-only bundle for all biases) to let the AXI burst inference actually widen the int8 transfers — the design fits comfortably without it, so it's a legitimate next lever for LUT margin, not a requirement. Also not attempted: Vivado IP packaging / block-design integration / bitstream generation for this INT8 top, held back pending explicit go-ahead per this phase's own scope (C-simulation and C-synthesis only).
+**Not attempted this pass**: splitting the mixed int8/int32 per-layer bundles into same-width bundles (e.g. one 8-bit-only bundle for all weights, one 32-bit-only bundle for all biases) to let the AXI burst inference actually widen the int8 transfers — the design fits comfortably without it, so it's a legitimate next lever for LUT margin, not a requirement.
 
-**Next step**: C5 and F6 (both dense ReLU layers) are now done in INT8, joining C1, C3 (conv/MAC layers) and S2, S4 (pooling) — six of the network's seven layers. Only the output dense layer (softmax) remains; its softmax stage will need its own INT8-appropriate treatment (softmax doesn't requantize to int8 the same way ReLU layers do, per this project's own float32 optimization log for that layer above).
+**Bitstream built on PYNQ-Z2 (`L5_int8_pynqz2/`, see `L5_int8_pynqz2/reports/README.md`):** same 7-master-`m_axi` block design pattern as the float32 `Lenet5_fpga_top_pynqz2` build, PS7 + `lenet5_top_int8_0` wrapped and fanned into one shared AXI interconnect. **Result: SUCCESS**, with more timing margin than the float32 PYNQ-Z2 build (WNS +0.121ns vs +0.033ns). At the full-system level: Slice LUTs −42.5%, Slice Registers −45.1%, Block RAM −69.9%, DSP48E1 +91.7% (same already-documented cause as the HLS-level combined-top finding above) — fits comfortably on every metric.
+
+**Next step**: run `dense_output_int8_fixedpoint`'s real Vitis HLS C-sim/C-synth (the one remaining individual-layer gap, see above). Otherwise, the INT8 network is synthesized, chained, and bitstream-built end-to-end on the PYNQ-Z2 — the next milestone is hardware validation: classify a real downloaded/handwritten digit image (`Data/downloaded_test/`, `src/test_downloaded_image.py`) on the board (or via PYNQ's Python API) and confirm it matches the Python integer reference.

@@ -10,8 +10,8 @@ import matplotlib.pyplot as plt
 from tensorflow.keras.datasets import mnist
 
 # ---- Choose which model to test ----
-MODEL_PATH = "models/lenet5.keras"          # baseline (tanh + AvgPool)
-# MODEL_PATH = "models/lenet5_relu.keras"   # uncomment to test the ReLU variant instead
+#MODEL_PATH = "models/lenet5.keras"          # baseline (tanh + AvgPool)
+MODEL_PATH = "models/lenet5_relu.keras"   # uncomment to test the ReLU variant instead
 
 model = tf.keras.models.load_model(MODEL_PATH)
 
@@ -20,7 +20,7 @@ x_test_norm = x_test.astype("float32") / 255.0
 x_test_norm = x_test_norm.reshape(-1, 28, 28, 1)
 
 # ---- Pick an image: change this index to test different digits ----
-INDEX = 19   # try any number from 0 to 9999
+INDEX = 48  # try any number from 0 to 9999
 
 image = x_test_norm[INDEX]
 true_label = y_test[INDEX]

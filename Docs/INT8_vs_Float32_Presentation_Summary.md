@@ -140,3 +140,38 @@ unlike the jump from Float32 to INT8, going further to INT4 does cost measurable
 (97.80% vs 98.40%) for comparatively modest additional memory savings — a trade-off that
 was not judged worthwhile once INT8 had already achieved the necessary resource and
 timing improvements.
+
+---
+
+## Part 3 — The Real, Complete Result: Two Full Bitstreams
+
+Everything above was building toward one thing: a complete, working FPGA implementation
+of all seven network layers combined, targeting the actual PYNQ-Z2 board. **Both a
+Float32 version and an INT8 version of this complete network have now been built,
+verified for correctness against real data, and carried all the way through to a real,
+physically valid bitstream file** — the final output that would configure real FPGA
+hardware, if loaded onto a physical board.
+
+### Final, Real, Whole-System Comparison (from actual Vivado place-and-route, not estimates)
+
+| Metric | Float32 (complete network) | INT8 (complete network) | Change |
+|---|---|---|---|
+| Timing met? | Yes (+0.033 ns margin) | **Yes (+0.121 ns margin — more comfortable)** | Improved |
+| General logic (LUT) | 55.3% of chip | **31.8% of chip** | 42.5% less |
+| Memory bits (FF) | 38.6% of chip | **21.2% of chip** | 45.1% less |
+| On-chip memory (BRAM) | 85.4% of chip | **25.7% of chip** | 69.9% less |
+| Multiply-hardware (DSP) | 10.9% of chip | 20.9% of chip | Higher (expected — see Part 2's DSP explanation; still comfortably within budget) |
+
+**Both versions work. Both meet timing with zero failing paths.** The INT8 version uses
+dramatically less of the chip's logic, memory, and on-chip storage — while also running
+with a *more* comfortable timing margin than the Float32 version, not a worse one. The
+only resource that increased (DSP) was expected, precisely explained (Part 2, and in
+full technical detail in the main project document), and remains well within budget
+either way (20.9% used, out of 100% available).
+
+### The One-Sentence Version
+
+**We chose INT8 because our own evidence — both a software accuracy simulation and two
+real, complete FPGA bitstreams — shows it costs no accuracy, uses roughly a third to a
+half of the hardware resources of the Float32 version, and results in a design that
+meets its timing requirement with more margin, not less.**
